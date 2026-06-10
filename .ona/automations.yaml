@@ -1,0 +1,32 @@
+services:
+  - name: Backend API
+    description: FastAPI backend server
+    command: |
+      cd backend && pip install -r requirements.txt && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    triggeredBy:
+      - postDevcontainerStart
+
+  - name: Frontend Dev Server
+    description: React frontend dev server with Vite
+    command: |
+      cd frontend && npm install && npm run dev
+    triggeredBy:
+      - postDevcontainerStart
+
+  - name: Docker Services
+    description: PostgreSQL, Redis via Docker Compose
+    command: |
+      docker compose up db redis
+    triggeredBy:
+      - postDevcontainerStart
+
+tasks:
+  - name: Run DB Migrations
+    description: Run Alembic database migrations
+    command: |
+      cd backend && alembic upgrade head
+
+  - name: Build Frontend
+    description: Build frontend for production
+    command: |
+      cd frontend && npm run build
