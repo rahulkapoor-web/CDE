@@ -145,15 +145,17 @@ class SalesforceConnector:
         result = self.sf.query(f"SELECT COUNT() FROM {object_name}")
         return result["totalSize"]
 
-    def query_records(self, soql: str) -> list[dict]:
-        """Execute a SOQL query and return all records."""
+    def query_records(self, soql: str) -> Generator[dict, None, None]:
+        """Execute a SOQL query and yield records with automatic pagination."""
         self._ensure_connected()
-        result = self.sf.query_all(soql)
-        records = result["records"]
-        # Remove Salesforce metadata attributes
-        for r in records:
-            r.pop("attributes", None)
-        return records
+        result = self.sf.query(soql)
+        while True:
+            for record in result["records"]:
+                record.pop("attributes", None)
+                yield record
+            if result.get("done"):
+                break
+            result = self.sf.query_more(result["nextRecordsUrl"], identifier_is_url=True)
 
     def bulk_query(self, object_name: str, fields: list[str]) -> Generator[dict, None, None]:
         """Stream records using Bulk API 2.0 for large datasets.

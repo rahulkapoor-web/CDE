@@ -22,9 +22,11 @@ from app.schemas.validation import (
     ValidationDetailResponse,
     ValidationDetailPage,
 )
+import asyncio
+import threading
+
 from app.services.connector_factory import build_connector
 from app.services.validation_engine import run_validation_for_object
-from app.workers.tasks import run_batch_validation
 
 router = APIRouter(prefix="/validation", tags=["validation"])
 
@@ -37,10 +39,7 @@ async def create_validation_run(
 ):
     """Create and start a validation run.
 
-    Mode selection:
-    - auto: checks record counts and picks realtime or batch per object
-    - realtime: runs inline, blocks until complete
-    - batch: queues as a Celery background job
+    Runs validation in a background thread to avoid blocking the API.
     """
     project = await db.get(MigrationProject, data.project_id)
     if not project or project.created_by != user.id:
@@ -51,56 +50,102 @@ async def create_validation_run(
         user_id=user.id,
         mode=data.mode,
         object_mapping_ids=data.object_mapping_ids,
+        record_limit=data.record_limit,
+        date_range_months=data.date_range_months,
+        source_where_clause=data.source_where_clause,
+        status="running",
+        started_at=datetime.now(timezone.utc),
     )
     db.add(run)
     await db.commit()
     await db.refresh(run)
 
-    if data.mode == "batch" or data.mode == "auto":
-        # Queue as background job
-        run.status = "queued"
-        await db.commit()
-        run_batch_validation.delay(run.id)
-    elif data.mode == "realtime":
-        # Run inline
-        run.status = "running"
-        run.started_at = datetime.now(timezone.utc)
+    # Run in background thread
+    run_id = run.id
+    def _run_in_thread():
+        asyncio.run(_execute_validation(run_id))
+
+    thread = threading.Thread(target=_run_in_thread, daemon=True)
+    thread.start()
+
+    return run
+
+
+async def _execute_validation(validation_run_id: str):
+    """Execute validation in a background thread with progress tracking."""
+    from app.core.database import create_background_session
+
+    bg_session = create_background_session()
+    async with bg_session() as db:
+        run = await db.get(ValidationRun, validation_run_id)
+        if not run:
+            return
+
+        # Immediately set phase so the UI shows activity
+        run.progress_phase = "initializing"
         await db.commit()
 
         try:
+            project = await db.get(MigrationProject, run.project_id)
             source_profile = await db.get(ConnectionProfile, project.source_connection_id)
             target_profile = await db.get(ConnectionProfile, project.target_connection_id)
 
-            if data.object_mapping_ids:
+            if run.object_mapping_ids:
                 mappings_result = await db.execute(
                     select(ObjectMapping).where(
-                        ObjectMapping.id.in_(data.object_mapping_ids),
+                        ObjectMapping.id.in_(run.object_mapping_ids),
                         ObjectMapping.is_active == True,
                     )
                 )
             else:
                 mappings_result = await db.execute(
                     select(ObjectMapping).where(
-                        ObjectMapping.project_id == data.project_id,
+                        ObjectMapping.project_id == run.project_id,
                         ObjectMapping.is_active == True,
                     )
                 )
             object_mappings = list(mappings_result.scalars().all())
 
-            for om in object_mappings:
+            # Set total count so frontend can show progress
+            run.total_objects = len(object_mappings)
+            run.completed_objects = 0
+            await db.commit()
+
+            for i, om in enumerate(object_mappings):
+                # Check if run was cancelled
+                await db.refresh(run)
+                if run.status == "cancelled":
+                    return
+
+                # Update current object being validated
+                label = f"{om.source_object} → {om.target_object}"
+                run.current_object_name = label
+                run.progress_phase = "connecting"
+                run.source_records_fetched = 0
+                run.target_records_fetched = 0
+                run.records_compared = 0
+                run.total_records_to_compare = 0
+                await db.commit()
+
                 await run_validation_for_object(db, run, om, source_profile, target_profile)
+
+                # Mark this object as done
+                run.completed_objects = i + 1
+                await db.commit()
 
             run.status = "completed"
             run.completed_at = datetime.now(timezone.utc)
-            await db.commit()
-        except Exception as e:
-            run.status = "failed"
-            run.error_message = str(e)
-            run.completed_at = datetime.now(timezone.utc)
+            run.current_object_name = None
+            run.progress_phase = "done"
             await db.commit()
 
-    await db.refresh(run)
-    return run
+        except Exception as e:
+            run.status = "failed"
+            run.error_message = str(e)[:500]
+            run.completed_at = datetime.now(timezone.utc)
+            run.current_object_name = None
+            run.progress_phase = None
+            await db.commit()
 
 
 @router.get("/runs", response_model=list[ValidationRunResponse])
@@ -126,6 +171,28 @@ async def get_validation_run(
     run = await db.get(ValidationRun, run_id)
     if not run or run.user_id != user.id:
         raise HTTPException(status_code=404, detail="Validation run not found")
+    return run
+
+
+@router.post("/runs/{run_id}/cancel", response_model=ValidationRunResponse)
+async def cancel_validation_run(
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Cancel a running or queued validation run."""
+    run = await db.get(ValidationRun, run_id)
+    if not run or run.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Validation run not found")
+
+    if run.status not in ("pending", "queued", "running"):
+        raise HTTPException(status_code=400, detail=f"Cannot cancel run with status '{run.status}'")
+
+    run.status = "cancelled"
+    run.completed_at = datetime.now(timezone.utc)
+    run.error_message = "Cancelled by user"
+    await db.commit()
+    await db.refresh(run)
     return run
 
 

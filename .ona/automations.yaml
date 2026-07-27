@@ -1,22 +1,36 @@
 services:
-  - name: Backend API
-    description: FastAPI backend server
+  - name: Database and Redis
+    description: PostgreSQL and Redis via Docker Compose
     command: |
-      cd backend && pip install -r requirements.txt && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      cd /workspaces/workspaces && docker compose up db redis
+    triggeredBy:
+      - postDevcontainerStart
+
+  - name: Backend API
+    description: FastAPI backend server with auto-restart
+    command: |
+      cd /workspaces/workspaces/backend
+      pip install -q -r requirements.txt
+      sleep 5
+      PYTHONPATH=. DATABASE_URL_SYNC=postgresql+psycopg2://postgres:postgres@localhost:5432/migration_bridge alembic upgrade head 2>/dev/null || true
+      while true; do
+        PYTHONPATH=. python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+        echo "Backend exited, restarting in 3s..."
+        sleep 3
+      done
     triggeredBy:
       - postDevcontainerStart
 
   - name: Frontend Dev Server
-    description: React frontend dev server with Vite
+    description: React frontend dev server with auto-restart
     command: |
-      cd frontend && npm install && npm run dev
-    triggeredBy:
-      - postDevcontainerStart
-
-  - name: Docker Services
-    description: PostgreSQL, Redis via Docker Compose
-    command: |
-      docker compose up db redis
+      cd /workspaces/workspaces/frontend
+      npm install
+      while true; do
+        npm run dev
+        echo "Frontend exited, restarting in 3s..."
+        sleep 3
+      done
     triggeredBy:
       - postDevcontainerStart
 
@@ -24,7 +38,7 @@ tasks:
   - name: Run DB Migrations
     description: Run Alembic database migrations
     command: |
-      cd backend && alembic upgrade head
+      cd backend && PYTHONPATH=. DATABASE_URL_SYNC=postgresql+psycopg2://postgres:postgres@localhost:5432/migration_bridge alembic upgrade head
 
   - name: Build Frontend
     description: Build frontend for production

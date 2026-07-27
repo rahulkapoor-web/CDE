@@ -90,13 +90,24 @@ export interface ValidationRun {
   id: string;
   project_id: string;
   user_id: string;
-  status: "pending" | "queued" | "running" | "completed" | "failed";
+  status: "pending" | "queued" | "running" | "completed" | "failed" | "cancelled";
   mode: string;
   started_at?: string;
   completed_at?: string;
   error_message?: string;
   created_at: string;
   object_mapping_ids?: string[];
+  record_limit?: number;
+  date_range_months?: number;
+  source_where_clause?: string;
+  total_objects: number;
+  completed_objects: number;
+  current_object_name?: string;
+  progress_phase?: string;
+  source_records_fetched: number;
+  target_records_fetched: number;
+  records_compared: number;
+  total_records_to_compare: number;
 }
 
 export interface ValidationSummary {

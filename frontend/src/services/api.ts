@@ -152,16 +152,27 @@ export const importMappings = (
   );
 };
 
+export const importMappingSheet = (projectId: string, file: File) => {
+  const formData = new FormData();
+  formData.append("file", file);
+  return api.post(`/projects/${projectId}/import-mapping-sheet`, formData);
+};
+
 // Validation
 export const createValidationRun = (data: {
   project_id: string;
   object_mapping_ids?: string[];
   mode?: string;
+  record_limit?: number;
+  date_range_months?: number;
+  source_where_clause?: string;
 }) => api.post("/validation/runs", data);
 export const getValidationRuns = (projectId?: string) =>
   api.get("/validation/runs", { params: { project_id: projectId } });
 export const getValidationRun = (runId: string) =>
   api.get(`/validation/runs/${runId}`);
+export const cancelValidationRun = (runId: string) =>
+  api.post(`/validation/runs/${runId}/cancel`);
 export const getValidationSummaries = (runId: string) =>
   api.get(`/validation/runs/${runId}/summaries`);
 export const getValidationDetails = (
@@ -188,3 +199,17 @@ export const exportDetailReport = (
     params: { format, status_filter: statusFilter },
     responseType: "blob",
   });
+
+// Cleanup
+export const getCleanupHierarchy = () => api.get("/cleanup/hierarchy");
+export const createCleanupJob = (data: {
+  project_id: string;
+  filter_mode: string;
+  country_code?: string;
+}) => api.post("/cleanup/jobs", data);
+export const getCleanupJobs = (projectId: string) =>
+  api.get("/cleanup/jobs", { params: { project_id: projectId } });
+export const getCleanupJob = (jobId: string) =>
+  api.get(`/cleanup/jobs/${jobId}`);
+export const cancelCleanupJob = (jobId: string) =>
+  api.post(`/cleanup/jobs/${jobId}/cancel`);

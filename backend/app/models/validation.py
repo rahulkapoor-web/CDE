@@ -34,6 +34,25 @@ class ValidationRun(Base):
     # Track which object mappings were included in this run
     object_mapping_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
+    # Sampling mode: limit records per object (None = all records)
+    record_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Date filter: only validate records created within last N months (None = all time)
+    date_range_months: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Custom SOQL WHERE clause for source query (without the WHERE keyword)
+    source_where_clause: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Progress tracking
+    total_objects: Mapped[int] = mapped_column(Integer, default=0)
+    completed_objects: Mapped[int] = mapped_column(Integer, default=0)
+    current_object_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    progress_phase: Mapped[str | None] = mapped_column(
+        String(50), nullable=True
+    )  # fetching_source, fetching_target, comparing, done
+    source_records_fetched: Mapped[int] = mapped_column(Integer, default=0)
+    target_records_fetched: Mapped[int] = mapped_column(Integer, default=0)
+    records_compared: Mapped[int] = mapped_column(Integer, default=0)
+    total_records_to_compare: Mapped[int] = mapped_column(Integer, default=0)
+
     summaries: Mapped[list["ValidationSummary"]] = relationship(
         back_populates="validation_run", cascade="all, delete-orphan"
     )

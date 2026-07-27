@@ -6,6 +6,9 @@ class ValidationRunCreate(BaseModel):
     project_id: str
     object_mapping_ids: list[str] | None = None  # None = all active mappings
     mode: str = "auto"  # auto, realtime, batch
+    record_limit: int | None = None  # None = all records, else sample N per object
+    date_range_months: int | None = None  # None = all time, else last N months by CreatedDate
+    source_where_clause: str | None = None  # Custom SOQL WHERE clause (without WHERE keyword)
 
 
 class ValidationRunResponse(BaseModel):
@@ -19,6 +22,17 @@ class ValidationRunResponse(BaseModel):
     error_message: str | None = None
     created_at: datetime
     object_mapping_ids: list[str] | None = None
+    record_limit: int | None = None
+    date_range_months: int | None = None
+    source_where_clause: str | None = None
+    total_objects: int = 0
+    completed_objects: int = 0
+    current_object_name: str | None = None
+    progress_phase: str | None = None
+    source_records_fetched: int = 0
+    target_records_fetched: int = 0
+    records_compared: int = 0
+    total_records_to_compare: int = 0
 
     model_config = {"from_attributes": True}
 

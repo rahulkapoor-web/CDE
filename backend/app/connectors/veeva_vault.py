@@ -36,7 +36,7 @@ class VeevaVaultConnector:
 
     def connect(self) -> dict:
         """Authenticate and establish a session."""
-        self._client = httpx.Client(timeout=120)
+        self._client = httpx.Client(timeout=60)
 
         if self._session_id:
             # Reuse existing session
@@ -65,8 +65,8 @@ class VeevaVaultConnector:
         """Test connectivity and return vault info."""
         try:
             self.connect()
-            # Fetch vault info
-            resp = self._request("GET", f"{self.base_url}/objects")
+            # Fetch vault info using metadata endpoint
+            resp = self._request("GET", f"{self.base_url}/metadata/vobjects")
             objects = resp.get("objects", [])
             return {
                 "success": True,
@@ -84,13 +84,23 @@ class VeevaVaultConnector:
         """List all Vault Objects."""
         self._ensure_connected()
         resp = self._request("GET", f"{self.base_url}/metadata/vobjects")
+        raw_objects = resp.get("objects", [])
         objects = []
-        for obj in resp.get("objects", []):
+        for obj in raw_objects:
+            # Handle both dict and string formats in the response
+            if isinstance(obj, dict):
+                name = obj.get("name", obj.get("object", ""))
+                label = obj.get("label", name)
+            elif isinstance(obj, str):
+                name = obj
+                label = obj
+            else:
+                continue
             objects.append(
                 {
-                    "name": obj.get("name", ""),
-                    "label": obj.get("label", obj.get("name", "")),
-                    "custom": obj.get("name", "").endswith("__v") is False,
+                    "name": name,
+                    "label": label,
+                    "custom": not name.endswith("__v") if name else False,
                     "queryable": True,
                 }
             )
@@ -193,6 +203,88 @@ class VeevaVaultConnector:
             resp = self._request("GET", next_url)
             for record in resp.get("data", []):
                 yield record
+
+    def delete_records(self, object_name: str, record_ids: list[str]) -> dict:
+        """Delete records from a Vault object in batches of 500 (Vault API limit).
+
+        Vault bulk delete API:
+          DELETE /api/{version}/vobjects/{object_name}
+          Body: CSV of record IDs (id header + one ID per line)
+          Content-Type: text/csv
+
+        Returns summary with success/failure counts.
+        """
+        import io
+
+        self._ensure_connected()
+        total_success = 0
+        total_failed = 0
+        errors = []
+
+        BATCH_SIZE = 500
+        for i in range(0, len(record_ids), BATCH_SIZE):
+            batch = record_ids[i : i + BATCH_SIZE]
+            try:
+                # Build CSV body: header "id" followed by one ID per line
+                csv_body = "id\n" + "\n".join(batch)
+
+                logger.info(
+                    f"Deleting {object_name} batch [{i}:{i+len(batch)}] "
+                    f"({len(batch)} records), first ID: {batch[0]}"
+                )
+
+                resp = self._client.request(
+                    "DELETE",
+                    f"{self.base_url}/vobjects/{object_name}",
+                    headers={
+                        "Content-Type": "text/csv",
+                        "Accept": "application/json",
+                    },
+                    content=csv_body,
+                )
+
+                logger.info(
+                    f"Delete response {object_name}: status={resp.status_code}"
+                )
+
+                resp.raise_for_status()
+                data = resp.json()
+
+                logger.info(
+                    f"Delete response body {object_name}: "
+                    f"responseStatus={data.get('responseStatus')}, "
+                    f"data count={len(data.get('data', []))}"
+                )
+
+                for result in data.get("data", []):
+                    if result.get("responseStatus") == "SUCCESS":
+                        total_success += 1
+                    else:
+                        total_failed += 1
+                        err_msgs = [
+                            e.get("message", "")
+                            for e in result.get("errors", [])
+                        ]
+                        if err_msgs:
+                            errors.append(
+                                f"{result.get('id', '?')}: {'; '.join(err_msgs)}"
+                            )
+
+                logger.info(
+                    f"Delete batch {object_name} [{i}:{i+len(batch)}]: "
+                    f"success={total_success}, failed={total_failed}"
+                )
+            except Exception as e:
+                total_failed += len(batch)
+                err_msg = str(e)[:300]
+                errors.append(err_msg)
+                logger.error(f"Delete batch error {object_name}: {err_msg}")
+
+        return {
+            "success": total_success,
+            "failed": total_failed,
+            "errors": errors[:20],
+        }
 
     def _request(self, method: str, url: str, **kwargs) -> dict:
         """Make an authenticated request to the Vault API."""
