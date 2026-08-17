@@ -1,3 +1,4 @@
+import { InboxOutlined } from "@ant-design/icons";
 import {
   Button,
   Card,
@@ -9,12 +10,23 @@ import {
   Select,
   Space,
   Spin,
+  Upload,
   message,
 } from "antd";
+import type { UploadFile } from "antd";
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { connectionsApi, planningApi } from "../services/api";
 import type { Connection, PlanningContext } from "../types";
+
+const ACCEPTED_IMAGE_TYPES = [
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+];
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_IMAGES = 4;
 
 const { TextArea } = Input;
 
@@ -24,6 +36,7 @@ export default function GeneratePage() {
   const [context, setContext] = useState<PlanningContext | null>(null);
   const [gathering, setGathering] = useState(false);
   const [generating, setGenerating] = useState(false);
+  const [designFiles, setDesignFiles] = useState<UploadFile[]>([]);
   const [gatherForm] = Form.useForm();
   const [ctxForm] = Form.useForm();
 
@@ -57,7 +70,13 @@ export default function GeneratePage() {
     setGenerating(true);
     try {
       const ctx = fromFormValues(values);
-      const plan = await planningApi.generate(ctx);
+      const files = designFiles
+        .map((f) => f.originFileObj as File | undefined)
+        .filter((f): f is File => !!f);
+      const plan =
+        files.length > 0
+          ? await planningApi.generateWithImages(ctx, files)
+          : await planningApi.generate(ctx);
       message.success("Plan generated");
       navigate(`/plans/${plan.id}`);
     } catch (e: unknown) {
@@ -66,6 +85,19 @@ export default function GeneratePage() {
     } finally {
       setGenerating(false);
     }
+  }
+
+  function beforeUpload(file: File): boolean {
+    if (!ACCEPTED_IMAGE_TYPES.includes(file.type)) {
+      message.error(`${file.name}: unsupported type. Use PNG, JPG, WebP, or GIF.`);
+      return Upload.LIST_IGNORE as unknown as boolean;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      message.error(`${file.name}: exceeds the 5 MB limit.`);
+      return Upload.LIST_IGNORE as unknown as boolean;
+    }
+    // Prevent auto-upload; we send files with the generate request.
+    return false;
   }
 
   return (
@@ -187,6 +219,38 @@ export default function GeneratePage() {
             </Form.Item>
             <Form.Item name="github_open_prs" label="Open PRs">
               <Select mode="tags" tokenSeparators={["\n"]} />
+            </Form.Item>
+
+            <Divider orientation="left">Design Reference (optional)</Divider>
+            <Form.Item
+              label="Figma / UI design images"
+              extra={`Upload up to ${MAX_IMAGES} exported images (PNG, JPG, WebP, GIF; max 5 MB each). Claude uses them as visual context for the plan.`}
+            >
+              <Upload.Dragger
+                multiple
+                accept={ACCEPTED_IMAGE_TYPES.join(",")}
+                listType="picture"
+                fileList={designFiles}
+                beforeUpload={beforeUpload}
+                onChange={({ fileList }) =>
+                  setDesignFiles(fileList.slice(0, MAX_IMAGES))
+                }
+                onRemove={(file) =>
+                  setDesignFiles((prev) =>
+                    prev.filter((f) => f.uid !== file.uid),
+                  )
+                }
+              >
+                <p className="ant-upload-drag-icon">
+                  <InboxOutlined />
+                </p>
+                <p className="ant-upload-text">
+                  Click or drag Figma export(s) here
+                </p>
+                <p className="ant-upload-hint">
+                  Export a frame from Figma as PNG/JPG and drop it here.
+                </p>
+              </Upload.Dragger>
             </Form.Item>
 
             <Space>

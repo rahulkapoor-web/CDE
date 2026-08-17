@@ -16,7 +16,9 @@ def _bullets(items: list[str]) -> str:
     return "\n".join(f"  - {i}" for i in items) if items else "  - (none)"
 
 
-def build_user_prompt(ctx: PlanningContext, guide_context: str = "") -> str:
+def build_user_prompt(
+    ctx: PlanningContext, guide_context: str = "", has_images: bool = False
+) -> str:
     """Assemble the runtime user prompt with all context variables filled."""
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     plan_id = f"ONA-{ctx.jira_ticket_id or 'UNKNOWN'}-{timestamp}"
@@ -26,6 +28,17 @@ def build_user_prompt(ctx: PlanningContext, guide_context: str = "") -> str:
         if guide_context.strip()
         else "\nNo LSC guide excerpts retrieved. Use your knowledge; where uncertain, "
         'write "Verify in LSC Configuration Guide: [topic]".\n'
+    )
+
+    design_block = (
+        "\nDESIGN REFERENCE: One or more UI design images (e.g. a Figma export) "
+        "are attached. Treat them as the target UI. Derive required fields, "
+        "components, layouts, labels, and interactions from the design and "
+        "reflect them in the plan's steps and acceptance checks. Where the "
+        "design implies Salesforce metadata (fields, page layouts, Lightning "
+        "components), specify it explicitly.\n"
+        if has_images
+        else ""
     )
 
     return f"""INPUTS PROVIDED TO YOU
@@ -58,6 +71,6 @@ GitHub Repo State:
 {_bullets(ctx.github_recent_commits)}
   - Open PRs:
 {_bullets(ctx.github_open_prs)}
-{guide_block}
+{guide_block}{design_block}
 Use plan_id = "{plan_id}" and jira_ticket = "{ctx.jira_ticket_id}".
 Return ONLY the JSON object, with no surrounding text or code fences."""

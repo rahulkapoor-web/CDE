@@ -8,7 +8,7 @@ import jsonschema
 from pydantic import ValidationError
 
 from app.core.config import settings
-from app.llm.base import LLMProvider
+from app.llm.base import ImageInput, LLMProvider
 from app.schemas.plan import Plan, validate_business_rules
 from app.schemas.plan_schema import PLAN_JSON_SCHEMA
 from app.schemas.planning import PlanningContext
@@ -76,14 +76,18 @@ async def generate_plan(
     context: PlanningContext,
     guide_context: str = "",
     max_retries: int | None = None,
+    images: list[ImageInput] | None = None,
 ) -> tuple[Plan, dict]:
     """Generate and validate a plan. Retries on invalid output.
+
+    ``images`` are optional design exports (e.g. a Figma frame) passed to the
+    provider as visual context on every attempt.
 
     Returns (plan, plan_dict). Raises PlanGenerationError on persistent failure.
     """
     max_retries = settings.PLAN_MAX_RETRIES if max_retries is None else max_retries
     system_prompt = load_system_prompt()
-    user_prompt = build_user_prompt(context, guide_context)
+    user_prompt = build_user_prompt(context, guide_context, has_images=bool(images))
 
     last_errors: list[str] = []
     attempts = 0
@@ -97,7 +101,7 @@ async def generate_plan(
                 + "\n".join(f"- {e}" for e in last_errors)
                 + "\n\nReturn a corrected JSON object that fixes all issues."
             )
-        result = await provider.complete(system_prompt, prompt)
+        result = await provider.complete(system_prompt, prompt, images=images)
         plan, errors = _validate(result.text)
         if plan is not None:
             return plan, plan.model_dump()

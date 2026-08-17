@@ -19,9 +19,13 @@ class FakeProvider(LLMProvider):
     def __init__(self, plan_dict: dict):
         self._plan = plan_dict
         self._model = "fake-model"
+        self.received_images = None
+        self.received_prompt = None
 
     async def complete(self, system_prompt, user_prompt, **kwargs) -> LLMResult:
-        # Echo back the ticket id supplied in the prompt into the plan.
+        # Record inputs so tests can assert images/prompt were forwarded.
+        self.received_images = kwargs.get("images")
+        self.received_prompt = user_prompt
         return LLMResult(text=json.dumps(self._plan), model=self._model, provider=self.name)
 
     async def embed(self, texts):
@@ -172,3 +176,111 @@ async def test_generate_rejects_invalid_llm_output(client, monkeypatch):
     detail = r.json()["detail"]
     assert detail["attempts"] >= 1
     assert detail["errors"]
+
+
+# A minimal valid 1x1 PNG.
+_PNG_1x1 = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+    "890000000d4944415478da6360000002000001e221bc330000000049454e44ae"
+    "426082"
+)
+
+
+@pytest.mark.asyncio
+async def test_generate_with_images_forwards_image_to_provider(
+    client, valid_plan_dict, monkeypatch
+):
+    import uuid
+
+    email = f"user_{uuid.uuid4().hex[:8]}@example.com"
+    r = await client.post(
+        "/api/auth/register",
+        json={"email": email, "password": "secret123"},
+    )
+    token = r.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    from app.api.routes import planning as planning_route
+
+    fake = FakeProvider(valid_plan_dict)
+    monkeypatch.setattr(planning_route, "get_llm_provider", lambda: fake)
+
+    context = {"jira_ticket_id": "LSC-1", "jira_summary": "Build UI"}
+    r = await client.post(
+        "/api/planning/generate-with-images",
+        headers=headers,
+        data={"context": json.dumps(context)},
+        files=[("files", ("design.png", _PNG_1x1, "image/png"))],
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["jira_ticket"] == "LSC-1"
+
+    # The image must have reached the provider, and the prompt should mention
+    # the attached design.
+    assert fake.received_images is not None
+    assert len(fake.received_images) == 1
+    assert fake.received_images[0].media_type == "image/png"
+    assert fake.received_images[0].data  # base64 payload present
+    assert "DESIGN REFERENCE" in fake.received_prompt
+
+
+@pytest.mark.asyncio
+async def test_generate_with_images_rejects_bad_type(
+    client, valid_plan_dict, monkeypatch
+):
+    import uuid
+
+    email = f"user_{uuid.uuid4().hex[:8]}@example.com"
+    r = await client.post(
+        "/api/auth/register",
+        json={"email": email, "password": "secret123"},
+    )
+    token = r.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    from app.api.routes import planning as planning_route
+
+    monkeypatch.setattr(
+        planning_route, "get_llm_provider", lambda: FakeProvider(valid_plan_dict)
+    )
+
+    context = {"jira_ticket_id": "LSC-2"}
+    r = await client.post(
+        "/api/planning/generate-with-images",
+        headers=headers,
+        data={"context": json.dumps(context)},
+        files=[("files", ("notes.txt", b"hello", "text/plain"))],
+    )
+    assert r.status_code == 400
+    assert "Unsupported image type" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_generate_with_images_no_files_still_works(
+    client, valid_plan_dict, monkeypatch
+):
+    import uuid
+
+    email = f"user_{uuid.uuid4().hex[:8]}@example.com"
+    r = await client.post(
+        "/api/auth/register",
+        json={"email": email, "password": "secret123"},
+    )
+    token = r.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    from app.api.routes import planning as planning_route
+
+    fake = FakeProvider(valid_plan_dict)
+    monkeypatch.setattr(planning_route, "get_llm_provider", lambda: fake)
+
+    context = {"jira_ticket_id": "LSC-3", "jira_summary": "No design"}
+    r = await client.post(
+        "/api/planning/generate-with-images",
+        headers=headers,
+        data={"context": json.dumps(context)},
+    )
+    assert r.status_code == 200, r.text
+    # No images -> provider receives images=None and no design block.
+    assert fake.received_images is None
+    assert "DESIGN REFERENCE" not in fake.received_prompt
