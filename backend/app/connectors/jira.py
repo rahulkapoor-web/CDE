@@ -22,19 +22,19 @@ class JiraConnector:
         return headers
 
     async def test(self) -> dict:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             r = await client.get(
                 f"{self.base_url}/rest/api/2/myself",
                 auth=self._auth(),
                 headers=self._headers(),
             )
             r.raise_for_status()
-            data = r.json()
+            data = _require_json(r)
             return {"account": data.get("displayName") or data.get("name", "unknown")}
 
     async def fetch_ticket(self, ticket_id: str) -> dict:
         fields = "summary,description,issuetype,priority,customfield_10000"
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             r = await client.get(
                 f"{self.base_url}/rest/api/2/issue/{ticket_id}",
                 params={"fields": fields},
@@ -42,7 +42,7 @@ class JiraConnector:
                 headers=self._headers(),
             )
             r.raise_for_status()
-            issue = r.json()
+            issue = _require_json(r)
         f = issue.get("fields", {})
         description = f.get("description") or ""
         if isinstance(description, dict):  # ADF (Cloud) — flatten text nodes.
@@ -58,6 +58,25 @@ class JiraConnector:
             "jira_type": (f.get("issuetype") or {}).get("name", ""),
             "jira_priority": (f.get("priority") or {}).get("name", ""),
         }
+
+
+def _require_json(response: httpx.Response) -> dict:
+    """Parse JSON, or raise a clear error when JIRA returned HTML.
+
+    A common failure mode is an auth redirect to a login page: the request
+    succeeds (200) but returns HTML, not the expected JSON. Surface that as a
+    helpful message instead of a raw JSON decode error.
+    """
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        raise ValueError(
+            "JIRA returned a non-JSON response "
+            f"(content-type: {content_type or 'unknown'}). This usually means the "
+            "base URL is wrong or the credentials/token are invalid (redirected to "
+            "a login page). Verify the base URL (e.g. https://your-org.atlassian.net) "
+            "and the email/API token."
+        )
+    return response.json()
 
 
 def _flatten_adf(node: dict) -> str:

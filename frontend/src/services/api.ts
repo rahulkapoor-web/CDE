@@ -50,6 +50,17 @@ export const connectionsApi = {
     const { data } = await api.post<Connection>("/connections", payload);
     return data;
   },
+  async update(
+    id: number,
+    payload: {
+      name?: string;
+      config?: Record<string, unknown>;
+      secrets?: Record<string, unknown>;
+    },
+  ) {
+    const { data } = await api.patch<Connection>(`/connections/${id}`, payload);
+    return data;
+  },
   async remove(id: number) {
     await api.delete(`/connections/${id}`);
   },
@@ -76,6 +87,17 @@ export const planningApi = {
   },
   async generate(context: PlanningContext) {
     const { data } = await api.post<Plan>("/planning/generate", { context });
+    return data;
+  },
+  async generateWithImages(context: PlanningContext, files: File[]) {
+    const form = new FormData();
+    form.set("context", JSON.stringify(context));
+    files.forEach((f) => form.append("files", f));
+    const { data } = await api.post<Plan>(
+      "/planning/generate-with-images",
+      form,
+      { headers: { "Content-Type": "multipart/form-data" } },
+    );
     return data;
   },
   async listPlans() {
