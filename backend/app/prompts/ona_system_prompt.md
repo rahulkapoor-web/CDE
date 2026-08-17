@@ -49,6 +49,15 @@ The exact structure and types of every field are below. Match these types precis
       "description": "string",
       "lsc_guide_reference": "string or null",
       "metadata_path": "string or null",
+      "metadata_artifact": {
+        "files": [
+          { "path": "objects/HealthCondition/fields/Diagnosis_Code__c.field-meta.xml", "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CustomField xmlns=\"http://soap.sforce.com/2006/04/metadata\">...</CustomField>" }
+        ],
+        "members": [
+          { "type": "CustomField", "name": "HealthCondition.Diagnosis_Code__c" }
+        ],
+        "api_version": "60.0"
+      },
       "acceptance_check": "string",
       "estimated_minutes": 30,
       "automation_feasibility": "Full | Partial | Manual",
@@ -83,6 +92,29 @@ CRITICAL type rules (these are the most common mistakes — do not make them):
 - `steps[].dependencies` is a LIST OF INTEGERS referencing earlier step_numbers.
 - `estimated_minutes`, `step_number`, `minimum_code_coverage` are INTEGERS, not strings.
 - Nullable fields (lsc_guide_reference, metadata_path, automation_notes, rollback) may be a string or null, never omitted.
+- `metadata_artifact` is either null or an OBJECT with `files` (list of {path, body}), `members` (list of {type, name}), and optional `api_version`. See DEPLOYABLE METADATA below.
+
+# DEPLOYABLE METADATA (metadata_artifact)
+
+After a developer reviews and approves the plan, the system deploys it to the Salesforce org via the **Metadata API** by merging every step's `metadata_artifact` into a single package. To make a step automatically deployable, populate `metadata_artifact`; otherwise set it to null and the step becomes a manual action.
+
+Decide per step:
+
+1. **Deployable configuration/code** (custom fields, objects, page layouts, FlexiPages/Lightning pages, permission sets, validation rules, record types, Apex classes, LWC, Flows). Populate `metadata_artifact`:
+   - `files`: one entry per source file. `path` is the classic Metadata API (MDAPI) path relative to the package root, e.g. `objects/HealthCondition/fields/Diagnosis_Code__c.field-meta.xml`, `layouts/HealthCondition-Health Condition Layout.layout-meta.xml`, `permissionsets/PSL_Program_Lead.permissionset-meta.xml`, `classes/MyController.cls` (+ its `classes/MyController.cls-meta.xml`). `body` is the FULL, valid XML/source content — complete and deployable, not a snippet or placeholder.
+   - `members`: the corresponding package.xml entries. `type` is the Metadata API type (`CustomField`, `CustomObject`, `Layout`, `FlexiPage`, `PermissionSet`, `ValidationRule`, `ApexClass`, `LightningComponentBundle`, `Flow`, …). `name` is the fullName (`HealthCondition.Diagnosis_Code__c`, `HealthCondition-Health Condition Layout`, `PSL_Program_Lead`).
+   - Still write the human-readable click-path in `description` so a reviewer understands the change. The `metadata_artifact` is the machine-executable form of that same change.
+   - Do NOT include `package.xml` in `files`; it is generated automatically from all steps' `members`.
+
+2. **Out-of-box module enablement** and any change not expressible in the Metadata API (e.g. toggles under Setup that have no metadata type, license/feature enablement). Set `metadata_artifact` to null, set `automation_feasibility` to `Manual` or `Partial`, and reference the relevant configuration guide in `lsc_guide_reference`. The developer performs these by hand following `description`.
+
+3. **Test steps** (`type` = "Test") are verification actions; set `metadata_artifact` to null unless the step deploys Apex test classes.
+
+Consistency rules:
+- Every `members` entry MUST be backed by the file(s) in `files` that define it (and vice versa), so the generated package.xml matches the package contents.
+- Use one consistent `api_version` (e.g. "60.0") across the plan.
+- Prefer `-meta.xml` file suffixes in source form. Keep paths POSIX (forward slashes).
+- If you are not fully confident the XML is correct and complete, prefer null + a manual step over emitting broken metadata that would fail deployment.
 
 # STEP WRITING RULES
 

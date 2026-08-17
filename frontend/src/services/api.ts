@@ -108,6 +108,21 @@ export const planningApi = {
     const { data } = await api.get<Plan>(`/planning/plans/${id}`);
     return data;
   },
+  async approve(id: number) {
+    const { data } = await api.post<Plan>(`/planning/plans/${id}/approve`);
+    return data;
+  },
+  async deploy(
+    id: number,
+    salesforceConnectionId: number,
+    checkOnly = false,
+  ) {
+    const { data } = await api.post<Plan>(`/planning/plans/${id}/deploy`, {
+      salesforce_connection_id: salesforceConnectionId,
+      check_only: checkOnly,
+    });
+    return data;
+  },
 };
 
 export default api;

@@ -48,6 +48,22 @@ export interface LscGuideReference {
   relevance: string;
 }
 
+export interface MetadataFile {
+  path: string;
+  body: string;
+}
+
+export interface MetadataMember {
+  type: string;
+  name: string;
+}
+
+export interface MetadataArtifact {
+  files: MetadataFile[];
+  members: MetadataMember[];
+  api_version?: string | null;
+}
+
 export interface PlanStep {
   step_number: number;
   title: string;
@@ -56,12 +72,31 @@ export interface PlanStep {
   description: string;
   lsc_guide_reference?: string | null;
   metadata_path?: string | null;
+  metadata_artifact?: MetadataArtifact | null;
   acceptance_check: string;
   estimated_minutes: number;
   automation_feasibility: string;
   automation_notes?: string | null;
   dependencies: number[];
   rollback?: string | null;
+}
+
+export interface DeployResult {
+  state?: string | null;
+  state_detail?: string | null;
+  succeeded?: boolean;
+  components_total?: string | null;
+  components_deployed?: string | null;
+  components_failed?: string | null;
+  component_errors?: Array<Record<string, unknown>>;
+  tests_total?: string | null;
+  tests_failed?: string | null;
+  test_errors?: Array<Record<string, unknown>>;
+  async_id?: string;
+  package_files?: string[];
+  steps_included?: number[];
+  check_only?: boolean;
+  error?: string;
 }
 
 export interface PlanJson {
@@ -102,6 +137,13 @@ export interface Plan {
   context_snapshot: PlanningContext;
   plan_json: PlanJson;
   created_at: string;
+  approved_at?: string | null;
+  approved_by_id?: number | null;
+  deploy_connection_id?: number | null;
+  deploy_async_id?: string | null;
+  deploy_started_at?: string | null;
+  deploy_finished_at?: string | null;
+  deploy_result?: DeployResult | null;
 }
 
 export interface PlanSummary {

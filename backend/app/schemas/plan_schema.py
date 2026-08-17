@@ -97,6 +97,37 @@ PLAN_JSON_SCHEMA: dict = {
                     "description": {"type": "string"},
                     "lsc_guide_reference": {"type": ["string", "null"]},
                     "metadata_path": {"type": ["string", "null"]},
+                    "metadata_artifact": {
+                        "type": ["object", "null"],
+                        "additionalProperties": False,
+                        "properties": {
+                            "files": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": ["path", "body"],
+                                    "properties": {
+                                        "path": {"type": "string"},
+                                        "body": {"type": "string"},
+                                    },
+                                },
+                            },
+                            "members": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "required": ["type", "name"],
+                                    "properties": {
+                                        "type": {"type": "string"},
+                                        "name": {"type": "string"},
+                                    },
+                                },
+                            },
+                            "api_version": {"type": ["string", "null"]},
+                        },
+                    },
                     "acceptance_check": {"type": "string"},
                     "estimated_minutes": {"type": "integer", "minimum": 0},
                     "automation_feasibility": {

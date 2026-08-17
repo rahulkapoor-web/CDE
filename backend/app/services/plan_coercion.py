@@ -237,6 +237,59 @@ def _coerce_lsc_reference(item: Any) -> Any:
     return item
 
 
+def _coerce_metadata_artifact(value: Any) -> Any:
+    """Normalize a step's metadata_artifact.
+
+    Only objects are meaningful. A string/list (model drift) or empty content is
+    treated as "no deployable metadata" -> None, turning the step manual rather
+    than failing strict validation. Well-formed dicts pass through with files and
+    members filtered to valid entries.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        # A string description or list is not deployable metadata.
+        return None
+
+    files = value.get("files")
+    members = value.get("members")
+
+    clean_files: list[dict] = []
+    if isinstance(files, list):
+        for f in files:
+            if (
+                isinstance(f, dict)
+                and isinstance(f.get("path"), str)
+                and isinstance(f.get("body"), str)
+                and f["path"].strip()
+            ):
+                clean_files.append({"path": f["path"], "body": f["body"]})
+
+    clean_members: list[dict] = []
+    if isinstance(members, list):
+        for m in members:
+            if (
+                isinstance(m, dict)
+                and isinstance(m.get("type"), str)
+                and isinstance(m.get("name"), str)
+                and m["type"].strip()
+                and m["name"].strip()
+            ):
+                clean_members.append({"type": m["type"], "name": m["name"]})
+
+    # Nothing usable -> manual step.
+    if not clean_files and not clean_members:
+        return None
+
+    result: dict[str, Any] = {"files": clean_files, "members": clean_members}
+    api_version = value.get("api_version")
+    if isinstance(api_version, (str, int, float)):
+        result["api_version"] = str(api_version)
+    else:
+        result["api_version"] = None
+    return result
+
+
 def coerce_plan_data(data: Any) -> Any:
     """Best-effort normalization of a decoded plan dict.
 
@@ -259,6 +312,10 @@ def coerce_plan_data(data: Any) -> Any:
                     step_numbers.append(n)
                 if "dependencies" in step:
                     step["dependencies"] = _int_list(step["dependencies"])
+                if "metadata_artifact" in step:
+                    step["metadata_artifact"] = _coerce_metadata_artifact(
+                        step["metadata_artifact"]
+                    )
 
     if "testing_requirements" in data:
         data["testing_requirements"] = _coerce_testing_requirements(

@@ -53,6 +53,13 @@ class PlanOut(BaseModel):
     context_snapshot: dict
     plan_json: dict
     created_at: datetime
+    approved_at: datetime | None = None
+    approved_by_id: int | None = None
+    deploy_connection_id: int | None = None
+    deploy_async_id: str | None = None
+    deploy_started_at: datetime | None = None
+    deploy_finished_at: datetime | None = None
+    deploy_result: dict | None = None
 
     class Config:
         from_attributes = True
@@ -67,3 +74,14 @@ class PlanSummaryOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class DeployPlanRequest(BaseModel):
+    """Deploy an approved plan to a connected Salesforce org.
+
+    ``check_only`` runs a validation-only deploy (nothing is committed) as a dry
+    run before the real deployment.
+    """
+
+    salesforce_connection_id: int
+    check_only: bool = False

@@ -185,6 +185,41 @@ def test_prerequisites_and_post_deployment_objects_flattened():
     assert plan.post_deployment == ["Run smoke test"]
 
 
+def test_metadata_artifact_string_becomes_null():
+    data = _base_plan()
+    data["steps"][0]["metadata_artifact"] = "deploy the custom field"
+    plan = _assert_valid(data)
+    assert plan.steps[0].metadata_artifact is None
+
+
+def test_metadata_artifact_empty_becomes_null():
+    data = _base_plan()
+    data["steps"][0]["metadata_artifact"] = {"files": [], "members": []}
+    plan = _assert_valid(data)
+    assert plan.steps[0].metadata_artifact is None
+
+
+def test_metadata_artifact_valid_preserved_and_bad_items_dropped():
+    data = _base_plan()
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {"path": "", "body": "x"},  # dropped: empty path
+            {"path": "objects/X.object", "body": "<x/>"},  # kept
+        ],
+        "members": [
+            {"type": "", "name": "x"},  # dropped: empty type
+            {"type": "CustomObject", "name": "X"},  # kept
+        ],
+        "api_version": 60.0,  # coerced to string
+    }
+    plan = _assert_valid(data)
+    art = plan.steps[0].metadata_artifact
+    assert art is not None
+    assert len(art.files) == 1 and art.files[0].path == "objects/X.object"
+    assert len(art.members) == 1 and art.members[0].name == "X"
+    assert art.api_version == "60.0"
+
+
 def test_non_dict_input_returned_unchanged():
     assert coerce_plan_data("not a dict") == "not a dict"
     assert coerce_plan_data([1, 2, 3]) == [1, 2, 3]

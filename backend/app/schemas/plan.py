@@ -36,6 +36,45 @@ class LscGuideReference(BaseModel):
     relevance: str
 
 
+class MetadataFile(BaseModel):
+    """A single file to place in a Metadata API deployment package.
+
+    ``path`` is relative to the package root in classic Metadata API (MDAPI)
+    format, e.g. ``objects/HealthCondition.object`` or
+    ``layouts/HealthCondition-Health Condition Layout.layout``. ``body`` is the
+    file's full XML content.
+    """
+
+    path: str
+    body: str
+
+
+class MetadataMember(BaseModel):
+    """One ``<types>`` entry for the generated package.xml.
+
+    ``type`` is the Metadata API type name (e.g. ``CustomField``,
+    ``CustomObject``, ``Layout``, ``PermissionSet``, ``FlexiPage``) and
+    ``name`` is the fullName member (e.g. ``HealthCondition.Diagnosis_Code__c``).
+    """
+
+    type: str
+    name: str
+
+
+class MetadataArtifact(BaseModel):
+    """Deployable metadata attached to a step.
+
+    Present only on steps that can be applied via the Metadata API. When absent,
+    the step is manual (e.g. an out-of-box enablement toggle) and is executed by
+    a human following the described clicks. The deployer merges the ``files`` and
+    ``members`` of every step's artifact into one package and deploys it.
+    """
+
+    files: list[MetadataFile] = Field(default_factory=list)
+    members: list[MetadataMember] = Field(default_factory=list)
+    api_version: str | None = None
+
+
 class PlanStep(BaseModel):
     step_number: int
     title: str
@@ -44,6 +83,7 @@ class PlanStep(BaseModel):
     description: str
     lsc_guide_reference: str | None = None
     metadata_path: str | None = None
+    metadata_artifact: MetadataArtifact | None = None
     acceptance_check: str
     estimated_minutes: int
     automation_feasibility: AutomationFeasibility
