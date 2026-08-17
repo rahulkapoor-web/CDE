@@ -1,0 +1,63 @@
+services:
+  - name: Database
+    description: PostgreSQL for ONA Planning Engine
+    commands:
+      start: |
+        docker rm -f ona-pg 2>/dev/null || true
+        docker run -d --name ona-pg \
+          -e POSTGRES_USER=postgres \
+          -e POSTGRES_PASSWORD=postgres \
+          -e POSTGRES_DB=ona_planner \
+          -p 5432:5432 postgres:16
+        docker logs -f ona-pg
+      ready: docker exec ona-pg pg_isready -U postgres
+    triggeredBy:
+      - postDevcontainerStart
+
+  - name: Backend API
+    description: FastAPI backend with auto-restart
+    commands:
+      start: |
+        cd backend
+        pip install -q -r requirements.txt
+        sleep 6
+        DATABASE_URL_SYNC=postgresql+psycopg2://postgres:postgres@localhost:5432/ona_planner \
+          alembic upgrade head 2>/dev/null || true
+        while true; do
+          DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/ona_planner \
+            python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+          echo "Backend exited, restarting in 3s..."
+          sleep 3
+        done
+    triggeredBy:
+      - postDevcontainerStart
+
+  - name: Frontend Dev Server
+    description: React frontend dev server with auto-restart
+    commands:
+      start: |
+        cd frontend
+        npm install
+        while true; do
+          npm run dev
+          echo "Frontend exited, restarting in 3s..."
+          sleep 3
+        done
+    triggeredBy:
+      - postDevcontainerStart
+
+tasks:
+  - name: Run DB Migrations
+    description: Run Alembic database migrations
+    command: |
+      cd backend && DATABASE_URL_SYNC=postgresql+psycopg2://postgres:postgres@localhost:5432/ona_planner alembic upgrade head
+
+  - name: Backend Tests
+    description: Run backend pytest suite
+    command: |
+      cd backend && DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/ona_planner python -m pytest -q
+
+  - name: Build Frontend
+    description: Build frontend for production
+    command: |
+      cd frontend && npm run build

@@ -1,5 +1,5 @@
 {
-  "name": "Migration Bridge",
+  "name": "ONA — AI Planning Engine",
   "image": "eu.repository.roche.com/cde-gitpod-docker-prd-l/ona-base:2.0",
   "features": {
     "ghcr.io/devcontainers/features/python:1": {
