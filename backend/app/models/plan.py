@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -17,7 +17,8 @@ class Plan(Base):
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     jira_ticket: Mapped[str] = mapped_column(String(64), index=True)
-    summary: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # LLM-authored free text; length is unbounded to avoid truncation errors.
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="generated")
     provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
