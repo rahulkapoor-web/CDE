@@ -12,6 +12,7 @@ from app.llm.base import ImageInput, LLMProvider
 from app.schemas.plan import Plan, validate_business_rules
 from app.schemas.plan_schema import PLAN_JSON_SCHEMA
 from app.schemas.planning import PlanningContext
+from app.services.plan_coercion import coerce_plan_data
 from app.services.prompt import build_user_prompt, load_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,9 @@ def _validate(raw: str) -> tuple[Plan | None, list[str]]:
         data = _extract_json(raw)
     except json.JSONDecodeError as exc:
         return None, [f"Response was not valid JSON: {exc}"]
+
+    # Normalize known LLM shape drift before strict validation.
+    data = coerce_plan_data(data)
 
     try:
         jsonschema.validate(data, PLAN_JSON_SCHEMA)
@@ -101,7 +105,12 @@ async def generate_plan(
                 + "\n".join(f"- {e}" for e in last_errors)
                 + "\n\nReturn a corrected JSON object that fixes all issues."
             )
-        result = await provider.complete(system_prompt, prompt, images=images)
+        result = await provider.complete(
+            system_prompt,
+            prompt,
+            images=images,
+            max_tokens=settings.PLAN_MAX_OUTPUT_TOKENS,
+        )
         plan, errors = _validate(result.text)
         if plan is not None:
             return plan, plan.model_dump()

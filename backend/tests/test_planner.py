@@ -17,10 +17,12 @@ class ScriptedProvider(LLMProvider):
     def __init__(self, responses: list[str]):
         self._responses = responses
         self.calls: list[str] = []
+        self.max_tokens_calls: list[int] = []
         self._model = "scripted-model"
 
     async def complete(self, system_prompt, user_prompt, **kwargs) -> LLMResult:
         self.calls.append(user_prompt)
+        self.max_tokens_calls.append(kwargs.get("max_tokens"))
         text = self._responses.pop(0)
         return LLMResult(text=text, model=self._model, provider=self.name)
 
@@ -54,6 +56,12 @@ async def test_generate_plan_succeeds_first_try(valid_plan_dict):
     assert plan.jira_ticket == "LSC-1"
     assert plan_dict["deployment_risk"] == "Low"
     assert len(provider.calls) == 1
+    # Plans are large; the generator must request the configured output budget
+    # (not the small default) to avoid mid-JSON truncation.
+    from app.core.config import settings
+
+    assert provider.max_tokens_calls[0] == settings.PLAN_MAX_OUTPUT_TOKENS
+    assert settings.PLAN_MAX_OUTPUT_TOKENS >= 16000
 
 
 @pytest.mark.asyncio

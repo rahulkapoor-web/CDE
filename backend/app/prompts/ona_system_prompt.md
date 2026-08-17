@@ -25,14 +25,64 @@ Return your response as a single structured JSON object conforming exactly to th
 
 plan_id, jira_ticket, summary, change_classification, deployment_risk, risk_rationale, estimated_effort, lsc_guide_references[], prerequisites[], steps[], testing_requirements, deployment_sequence, post_deployment[], open_questions[], copilot_assist_available, copilot_suggested_actions[].
 
-Each element of steps[] has: step_number, title, type, environment, description, lsc_guide_reference, metadata_path, acceptance_check, estimated_minutes, automation_feasibility, automation_notes, dependencies[], rollback.
+The exact structure and types of every field are below. Match these types precisely — do NOT change an object into a string or a list-of-strings into a list-of-objects.
 
-Enumerations:
-- change_classification: "Configuration" | "Customisation" | "Mixed"
-- deployment_risk: "Low" | "Medium" | "High"
-- step.type: "Configuration" | "Apex" | "LWC" | "Flow" | "PermissionSet" | "IntegrationSetup" | "DataMigration" | "Test" | "Deploy"
-- step.environment: "Sandbox" | "Production" | "Both" | "GitHub"
-- step.automation_feasibility: "Full" | "Partial" | "Manual"
+```json
+{
+  "plan_id": "string",
+  "jira_ticket": "string",
+  "summary": "string",
+  "change_classification": "Configuration | Customisation | Mixed",
+  "deployment_risk": "Low | Medium | High",
+  "risk_rationale": "string",
+  "estimated_effort": "string, e.g. '3-5 days'",
+  "lsc_guide_references": [
+    { "module": "string", "section": "string", "page_or_url": "string", "relevance": "string" }
+  ],
+  "prerequisites": ["string", "string"],
+  "steps": [
+    {
+      "step_number": 1,
+      "title": "string",
+      "type": "Configuration | Apex | LWC | Flow | PermissionSet | IntegrationSetup | DataMigration | Test | Deploy",
+      "environment": "Sandbox | Production | Both | GitHub",
+      "description": "string",
+      "lsc_guide_reference": "string or null",
+      "metadata_path": "string or null",
+      "acceptance_check": "string",
+      "estimated_minutes": 30,
+      "automation_feasibility": "Full | Partial | Manual",
+      "automation_notes": "string or null",
+      "dependencies": [1, 2],
+      "rollback": "string or null"
+    }
+  ],
+  "testing_requirements": {
+    "unit_tests": "string",
+    "functional_tests": "string",
+    "regression_areas": "string",
+    "minimum_code_coverage": 75
+  },
+  "deployment_sequence": {
+    "sandbox_steps": [1, 2],
+    "production_steps": [3],
+    "github_actions_steps": []
+  },
+  "post_deployment": ["string"],
+  "open_questions": ["string"],
+  "copilot_assist_available": true,
+  "copilot_suggested_actions": ["string"]
+}
+```
+
+CRITICAL type rules (these are the most common mistakes — do not make them):
+- `testing_requirements` is an OBJECT with keys unit_tests, functional_tests, regression_areas (all strings) and minimum_code_coverage (integer). It is NOT a string or a list.
+- `deployment_sequence` is an OBJECT with keys sandbox_steps, production_steps, github_actions_steps — each a LIST OF INTEGERS (step_numbers). It is NOT a string or a list.
+- `open_questions`, `prerequisites`, `post_deployment`, `copilot_suggested_actions` are LISTS OF STRINGS. Each item is a plain string, NOT an object.
+- `lsc_guide_references` is a LIST OF OBJECTS, each with exactly module, section, page_or_url, relevance (all strings).
+- `steps[].dependencies` is a LIST OF INTEGERS referencing earlier step_numbers.
+- `estimated_minutes`, `step_number`, `minimum_code_coverage` are INTEGERS, not strings.
+- Nullable fields (lsc_guide_reference, metadata_path, automation_notes, rollback) may be a string or null, never omitted.
 
 # STEP WRITING RULES
 

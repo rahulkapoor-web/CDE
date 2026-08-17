@@ -42,6 +42,10 @@ class Settings(BaseSettings):
 
     # Planning engine
     PLAN_MAX_RETRIES: int = 2
+    # Max output tokens per generation. Plans are large JSON documents; the
+    # previous 8000 default truncated responses mid-JSON. Sonnet 4.5 supports
+    # much higher output limits.
+    PLAN_MAX_OUTPUT_TOKENS: int = 16000
 
     # RAG embeddings
     EMBEDDING_PROVIDER: str = "openai"  # "openai" | "none"
