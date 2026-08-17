@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     # LLM provider selection: "anthropic" | "openai"
     LLM_PROVIDER: str = "anthropic"
     ANTHROPIC_API_KEY: str = ""
+    # Gateway/proxy support: when ANTHROPIC_API_KEY is absent, the SDK can
+    # authenticate via an auth token + base URL + custom headers (e.g. an
+    # Anthropic-compatible gateway that injects the real credentials).
+    ANTHROPIC_AUTH_TOKEN: str = ""
+    ANTHROPIC_BASE_URL: str = ""
+    ANTHROPIC_CUSTOM_HEADERS: str = ""
     ANTHROPIC_MODEL: str = "claude-sonnet-4-5"
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o"
