@@ -1,14 +1,21 @@
 services:
   - name: Database
-    description: PostgreSQL for ONA Planning Engine
+    description: PostgreSQL for ONA Planning Engine (data persisted in a named volume)
     commands:
       start: |
-        docker rm -f ona-pg 2>/dev/null || true
-        docker run -d --name ona-pg \
-          -e POSTGRES_USER=postgres \
-          -e POSTGRES_PASSWORD=postgres \
-          -e POSTGRES_DB=ona_planner \
-          -p 5432:5432 postgres:16
+        # Persist data across restarts in a named volume so users/plans survive.
+        # Reuse the existing container if present; only create it when missing.
+        # IMPORTANT: never `docker rm` here — that would wipe the database.
+        if [ -z "$(docker ps -aq -f name=^ona-pg$)" ]; then
+          docker run -d --name ona-pg \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=ona_planner \
+            -v ona-pg-data:/var/lib/postgresql/data \
+            -p 5432:5432 postgres:16
+        else
+          docker start ona-pg
+        fi
         docker logs -f ona-pg
       ready: docker exec ona-pg pg_isready -U postgres
     triggeredBy:

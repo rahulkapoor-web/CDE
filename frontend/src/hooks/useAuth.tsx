@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useContext, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import type { User } from "../types";
 import { authApi } from "../services/api";
@@ -12,13 +12,23 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
-export function AuthProvider({ children }: { children: ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
+function readStoredUser(): User | null {
+  // Only treat the session as valid if BOTH the token and user are present.
+  const token = localStorage.getItem("token");
+  const stored = localStorage.getItem("user");
+  if (!token || !stored) return null;
+  try {
+    return JSON.parse(stored) as User;
+  } catch {
+    return null;
+  }
+}
 
-  useEffect(() => {
-    const stored = localStorage.getItem("user");
-    if (stored) setUser(JSON.parse(stored));
-  }, []);
+export function AuthProvider({ children }: { children: ReactNode }) {
+  // Initialize synchronously from localStorage so the very first render already
+  // has the restored session. Otherwise route guards see null on refresh and
+  // redirect to /login before an effect can restore it.
+  const [user, setUser] = useState<User | null>(() => readStoredUser());
 
   function persist(token: string, u: User) {
     localStorage.setItem("token", token);

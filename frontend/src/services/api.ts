@@ -16,6 +16,26 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
+// On an expired/invalid token, clear the session and send the user to login.
+// Only react to auth failures on authenticated calls (not the login attempt
+// itself, which legitimately returns 401 on wrong credentials).
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const status = error?.response?.status;
+    const url: string = error?.config?.url || "";
+    const isAuthAttempt = url.includes("/auth/login") || url.includes("/auth/register");
+    if (status === 401 && !isAuthAttempt) {
+      localStorage.removeItem("token");
+      localStorage.removeItem("user");
+      if (window.location.pathname !== "/login") {
+        window.location.assign("/login");
+      }
+    }
+    return Promise.reject(error);
+  },
+);
+
 export const authApi = {
   async register(email: string, password: string, fullName?: string) {
     const { data } = await api.post<AuthResponse>("/auth/register", {
