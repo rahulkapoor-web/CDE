@@ -116,7 +116,8 @@ class _FakeSF:
 
     def deploy(self, zipfile_obj, sandbox, **kwargs):
         self.deploy_kwargs = {"sandbox": sandbox, **kwargs}
-        return ("0Af_ASYNC", "Queued")
+        # Matches the real simple_salesforce.Salesforce.deploy return shape.
+        return {"asyncId": "0Af_ASYNC", "state": "Queued"}
 
     def checkDeployStatus(self, async_id):
         assert async_id == "0Af_ASYNC"
@@ -184,6 +185,23 @@ def test_deploy_plan_check_only_sets_flag(valid_plan_dict):
         _sleep=lambda s: None,
     )
     assert sf.deploy_kwargs["checkOnly"] is True
+
+
+def test_deploy_plan_accepts_tuple_return(valid_plan_dict):
+    """Older simple_salesforce variants return a (asyncId, state) tuple."""
+    plan = _plan_with_artifacts(valid_plan_dict)
+
+    class _TupleSF(_FakeSF):
+        def deploy(self, zipfile_obj, sandbox, **kwargs):
+            self.deploy_kwargs = {"sandbox": sandbox, **kwargs}
+            return ("0Af_ASYNC", "Queued")
+
+    sf = _TupleSF(states=["Succeeded"])
+    async_id, status = deploy_plan(
+        sf, plan, is_sandbox=True, poll_interval=0, _sleep=lambda s: None
+    )
+    assert async_id == "0Af_ASYNC"
+    assert status["succeeded"] is True
 
 
 def test_deploy_plan_times_out(valid_plan_dict):

@@ -187,13 +187,21 @@ def deploy_plan(
         check_only,
     )
 
-    async_id, _state = sf.deploy(
+    # simple_salesforce >= 1.12 returns a dict {"asyncId", "state"} from
+    # deploy(); older/newer variants may return a tuple. Handle both.
+    deploy_ret = sf.deploy(
         io.BytesIO(package.zip_bytes),
         sandbox=is_sandbox,
         checkOnly=check_only,
         rollbackOnError=True,
         singlePackage=True,
     )
+    if isinstance(deploy_ret, dict):
+        async_id = deploy_ret.get("asyncId") or deploy_ret.get("id")
+    else:
+        async_id = deploy_ret[0]
+    if not async_id:
+        raise RuntimeError(f"Deploy did not return an async id: {deploy_ret!r}")
 
     deadline = time.monotonic() + timeout
     status: dict = {}

@@ -51,7 +51,7 @@ The exact structure and types of every field are below. Match these types precis
       "metadata_path": "string or null",
       "metadata_artifact": {
         "files": [
-          { "path": "objects/HealthCondition/fields/Diagnosis_Code__c.field-meta.xml", "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CustomField xmlns=\"http://soap.sforce.com/2006/04/metadata\">...</CustomField>" }
+          { "path": "objects/HealthCondition.object", "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CustomObject xmlns=\"http://soap.sforce.com/2006/04/metadata\">\n  <fields>\n    <fullName>Diagnosis_Code__c</fullName>\n    <label>Diagnosis Code</label>\n    <type>Text</type>\n    <length>255</length>\n  </fields>\n</CustomObject>" }
         ],
         "members": [
           { "type": "CustomField", "name": "HealthCondition.Diagnosis_Code__c" }
@@ -100,20 +100,68 @@ After a developer reviews and approves the plan, the system deploys it to the Sa
 
 Decide per step:
 
-1. **Deployable configuration/code** (custom fields, objects, page layouts, FlexiPages/Lightning pages, permission sets, validation rules, record types, Apex classes, LWC, Flows). Populate `metadata_artifact`:
-   - `files`: one entry per source file. `path` is the classic Metadata API (MDAPI) path relative to the package root, e.g. `objects/HealthCondition/fields/Diagnosis_Code__c.field-meta.xml`, `layouts/HealthCondition-Health Condition Layout.layout-meta.xml`, `permissionsets/PSL_Program_Lead.permissionset-meta.xml`, `classes/MyController.cls` (+ its `classes/MyController.cls-meta.xml`). `body` is the FULL, valid XML/source content — complete and deployable, not a snippet or placeholder.
-   - `members`: the corresponding package.xml entries. `type` is the Metadata API type (`CustomField`, `CustomObject`, `Layout`, `FlexiPage`, `PermissionSet`, `ValidationRule`, `ApexClass`, `LightningComponentBundle`, `Flow`, …). `name` is the fullName (`HealthCondition.Diagnosis_Code__c`, `HealthCondition-Health Condition Layout`, `PSL_Program_Lead`).
-   - Still write the human-readable click-path in `description` so a reviewer understands the change. The `metadata_artifact` is the machine-executable form of that same change.
-   - Do NOT include `package.xml` in `files`; it is generated automatically from all steps' `members`.
+You MUST use the classic **Metadata API (MDAPI) format**, NOT the newer source (SFDX decomposed) format. This is critical: the deployer zips your files exactly as given and deploys them via the Metadata API. Source-format paths like `objects/Account/fields/X.field-meta.xml` will FAIL with "named in package.xml, but was not found in zipped directory".
 
-2. **Out-of-box module enablement** and any change not expressible in the Metadata API (e.g. toggles under Setup that have no metadata type, license/feature enablement). Set `metadata_artifact` to null, set `automation_feasibility` to `Manual` or `Partial`, and reference the relevant configuration guide in `lsc_guide_reference`. The developer performs these by hand following `description`.
+Key differences in MDAPI format:
+- Custom fields, validation rules, list views, etc. are NOT separate files. They live INSIDE the object file `objects/<Object>.object` as child elements (`<fields>`, `<validationRules>`, …).
+- File extensions have NO `-meta.xml` suffix: use `objects/Account.object`, `layouts/Account-Account Layout.layout`, `permissionsets/PSL.permissionset`, `classes/MyController.cls` (with a separate `classes/MyController.cls-meta.xml` for Apex only).
+
+1. **Deployable configuration/code**. Populate `metadata_artifact`:
+   - `files`: one entry per MDAPI file. `body` is the FULL, valid XML/source — complete and deployable, not a snippet or placeholder.
+   - `members`: the corresponding package.xml entries. `type` is the Metadata API type; `name` is the fullName. For a custom field, the member is `CustomField` / `Account.Preferred_Pharmacy__c` even though the field lives inside `objects/Account.object`.
+   - If two steps modify the SAME object (e.g. two new fields on Account), each step should still describe its own change; put the field XML for each in a file at the SAME path `objects/Account.object` only if the bodies are identical — otherwise combine both fields into ONE step's `objects/Account.object` file containing both `<fields>` blocks, and reference both fields in that step's `members`. Never emit two different bodies for the same path.
+   - Still write the human-readable click-path in `description`. Do NOT include `package.xml` in `files`; it is generated from all steps' `members`.
+
+   Canonical examples (copy these shapes exactly):
+
+   Custom field on Account — file path `objects/Account.object`:
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+       <fields>
+           <fullName>Preferred_Pharmacy__c</fullName>
+           <label>Preferred Pharmacy</label>
+           <type>Text</type>
+           <length>255</length>
+           <required>false</required>
+       </fields>
+   </CustomObject>
+   ```
+   member: `{ "type": "CustomField", "name": "Account.Preferred_Pharmacy__c" }`
+
+   Permission set granting field access — file path `permissionsets/PSL_Care_Coordinator.permissionset`:
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+       <label>Care Coordinator</label>
+       <fieldPermissions>
+           <field>Account.Preferred_Pharmacy__c</field>
+           <editable>true</editable>
+           <readable>true</readable>
+       </fieldPermissions>
+   </PermissionSet>
+   ```
+   member: `{ "type": "PermissionSet", "name": "PSL_Care_Coordinator" }`
+
+   Apex class — TWO files: `classes/Foo.cls` (the code) and `classes/Foo.cls-meta.xml`:
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <ApexClass xmlns="http://soap.sforce.com/2006/04/metadata">
+       <apiVersion>60.0</apiVersion>
+       <status>Active</status>
+   </ApexClass>
+   ```
+   member: `{ "type": "ApexClass", "name": "Foo" }`
+
+2. **Out-of-box module enablement** and any change not expressible in the Metadata API (Setup toggles with no metadata type, license/feature enablement). Set `metadata_artifact` to null, set `automation_feasibility` to `Manual` or `Partial`, and reference the relevant configuration guide in `lsc_guide_reference`. The developer performs these by hand following `description`.
 
 3. **Test steps** (`type` = "Test") are verification actions; set `metadata_artifact` to null unless the step deploys Apex test classes.
 
 Consistency rules:
-- Every `members` entry MUST be backed by the file(s) in `files` that define it (and vice versa), so the generated package.xml matches the package contents.
+- Every `members` entry MUST be backed by the file(s) in `files` (and vice versa), so the generated package.xml matches the package contents.
 - Use one consistent `api_version` (e.g. "60.0") across the plan.
-- Prefer `-meta.xml` file suffixes in source form. Keep paths POSIX (forward slashes).
+- Keep paths POSIX (forward slashes). Use MDAPI extensions (no `-meta.xml` except for Apex/LWC).
+- Page layouts must be edited as a whole `.layout` file; if you cannot reproduce the full existing layout, make the layout change a MANUAL step (null artifact) rather than risk overwriting it.
 - If you are not fully confident the XML is correct and complete, prefer null + a manual step over emitting broken metadata that would fail deployment.
 
 # STEP WRITING RULES
