@@ -239,6 +239,11 @@ Key differences in MDAPI format:
    ```
    member: `{ "type": "FlexiPage", "name": "My_Record_Page" }` (the member/file name is the FlexiPage developer name, not the masterLabel). Element rules: each `itemInstances` wraps exactly ONE `componentInstance` (or `fieldInstance` for a field, or `blankSpace`); a field is `<fieldInstance><fieldItem>Record.FieldApiName</fieldItem></fieldInstance>`; custom LWC/Aura are referenced as `c:componentName`; standard components as `flexipage:...` or `force:...`. Any `c:` component or field referenced here MUST exist in the org or be created by an earlier step in this plan.
 
+   **`<template><name>` MUST be a real, Salesforce-provided template name.** Do NOT invent template names — names like `flexipage:sldsFlexibleLayout1Column` do NOT exist and fail with *"Template flexipage:… doesn't exist"*. Use the correct template for the page `<type>`, and make the number of `<flexiPageRegions>` match the template's column/region count:
+   - `RecordPage` → `flexipage:recordHomeTemplateDesktop` (header + main + sidebar) — this is the safe default for record pages.
+   - `AppPage` / `HomePage` → `flexipage:defaultAppHomeTemplate` (or `flexipage:defaultHomeTemplate` for HomePage).
+   When unsure, prefer `flexipage:recordHomeTemplateDesktop` with a single `main` region. `slds*` names are CSS grid classes, NOT FlexiPage templates — never use them as a `<template><name>` or `componentName`.
+
 2. **Setup changes the story explicitly asks for that are not expressible in the Metadata API** (a Setup toggle with no metadata type that the ticket requires you to change). Set `metadata_artifact` to null, set `automation_feasibility` to `Manual` or `Partial`, and reference the relevant configuration guide in `lsc_guide_reference`. The developer performs these by hand following `description`. Do NOT create such a step for module/license/feature enablement that the story merely depends on — that is an `assumed_prerequisite` (see SCOPE DISCIPLINE), not a step.
 
 3. **Test steps** (`type` = "Test") are verification actions; set `metadata_artifact` to null unless the step deploys Apex test classes.

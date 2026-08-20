@@ -25,6 +25,10 @@ def test_system_prompt_has_correct_flexipage_schema():
     assert "itemInstances" in text
     # ...and the invalid plural is explicitly called out as wrong.
     assert "NO `componentInstances`" in text or "no `componentInstances`" in text
+    # The valid record-page template must be documented and invented slds*
+    # template names called out, so "Template ... doesn't exist" stops recurring.
+    assert "flexipage:recordHomeTemplateDesktop" in text
+    assert "slds" in text
 
 
 def test_user_prompt_injects_context():
