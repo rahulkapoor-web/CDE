@@ -58,6 +58,29 @@ async def client():
         await engine.dispose()
 
 
+async def _await_generation(client, headers, plan_id, timeout: float = 10.0) -> dict:
+    """Poll a plan until background generation leaves the 'generating' state.
+
+    Generation runs in a background task, so the POST returns a pending plan
+    immediately. Tests wait here for the terminal state (generated or
+    generation_failed) before asserting on the result.
+    """
+    import asyncio
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        r = await client.get(f"/api/planning/plans/{plan_id}", headers=headers)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        if body["status"] != "generating":
+            return body
+        if asyncio.get_event_loop().time() > deadline:
+            raise AssertionError(
+                f"Plan {plan_id} stuck in 'generating' after {timeout}s"
+            )
+        await asyncio.sleep(0.05)
+
+
 @pytest.mark.asyncio
 async def test_full_flow(client, valid_plan_dict, monkeypatch):
     import uuid
@@ -130,9 +153,15 @@ async def test_full_flow(client, valid_plan_dict, monkeypatch):
     )
     assert r.status_code == 200, r.text
     plan = r.json()
+    # Generation is async: the POST returns a pending plan immediately.
+    assert plan["status"] == "generating"
+    plan_id = plan["id"]
+
+    # Wait for background generation to finish, then assert on the result.
+    plan = await _await_generation(client, headers, plan_id)
+    assert plan["status"] == "generated"
     assert plan["jira_ticket"] == "LSC-1"
     assert plan["plan_json"]["deployment_risk"] == "Low"
-    plan_id = plan["id"]
 
     # History lists the plan.
     r = await client.get("/api/planning/plans", headers=headers)
@@ -172,10 +201,13 @@ async def test_generate_rejects_invalid_llm_output(client, monkeypatch):
     r = await client.post(
         "/api/planning/generate", headers=headers, json={"context": context}
     )
-    assert r.status_code == 422
-    detail = r.json()["detail"]
-    assert detail["attempts"] >= 1
-    assert detail["errors"]
+    # The POST accepts the request; the invalid LLM output surfaces later as a
+    # generation_failed status with the error recorded on the plan.
+    assert r.status_code == 200, r.text
+    plan_id = r.json()["id"]
+    plan = await _await_generation(client, headers, plan_id)
+    assert plan["status"] == "generation_failed"
+    assert plan["generation_error"]
 
 
 # A minimal valid 1x1 PNG.
@@ -213,7 +245,10 @@ async def test_generate_with_images_forwards_image_to_provider(
         files=[("files", ("design.png", _PNG_1x1, "image/png"))],
     )
     assert r.status_code == 200, r.text
-    assert r.json()["jira_ticket"] == "LSC-1"
+    assert r.json()["status"] == "generating"
+    plan = await _await_generation(client, headers, r.json()["id"])
+    assert plan["status"] == "generated"
+    assert plan["jira_ticket"] == "LSC-1"
 
     # The image must have reached the provider, and the prompt should mention
     # the attached design.
@@ -281,6 +316,9 @@ async def test_generate_with_images_no_files_still_works(
         data={"context": json.dumps(context)},
     )
     assert r.status_code == 200, r.text
+    assert r.json()["status"] == "generating"
+    plan = await _await_generation(client, headers, r.json()["id"])
+    assert plan["status"] == "generated"
     # No images -> provider receives images=None and no design block.
     assert fake.received_images is None
     assert "DESIGN REFERENCE" not in fake.received_prompt
@@ -337,7 +375,11 @@ async def _generate_plan(client, headers) -> int:
         json={"context": {"jira_ticket_id": "LSC-1"}},
     )
     assert r.status_code == 200, r.text
-    return r.json()["id"]
+    plan_id = r.json()["id"]
+    # Generation is async; wait for it to finish so callers get a ready plan.
+    body = await _await_generation(client, headers, plan_id)
+    assert body["status"] == "generated", body
+    return plan_id
 
 
 @pytest.mark.asyncio

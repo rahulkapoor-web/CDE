@@ -12,6 +12,7 @@ import {
   List,
   Modal,
   Popconfirm,
+  Result,
   Row,
   Select,
   Space,
@@ -410,10 +411,30 @@ export default function PlanDetailPage() {
 
   useEffect(() => {
     if (!id) return;
-    planningApi
-      .getPlan(Number(id))
-      .then(setPlan)
-      .finally(() => setLoading(false));
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    // Generation runs in the background; poll while the plan is still being
+    // generated so the page flips to the finished plan (or the failure) on its
+    // own without the user reloading.
+    const tick = async () => {
+      try {
+        const p = await planningApi.getPlan(Number(id));
+        if (cancelled) return;
+        setPlan(p);
+        if (p.status === "generating") {
+          timer = setTimeout(tick, 3000);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    tick();
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
   }, [id]);
 
   useEffect(() => {
@@ -658,6 +679,40 @@ export default function PlanDetailPage() {
 
   if (loading) return <Spin />;
   if (!plan) return <Empty description="Plan not found" />;
+
+  // Background generation in progress: show a spinner and let the poll flip the
+  // page to the finished plan (or the failure) on its own.
+  if (plan.status === "generating") {
+    return (
+      <Result
+        icon={<Spin size="large" />}
+        title="Generating plan…"
+        subTitle="The AI is drafting your plan. This usually takes a minute or two — this page updates automatically."
+        extra={<Button onClick={() => navigate("/plans")}>← Back to plans</Button>}
+      />
+    );
+  }
+
+  if (plan.status === "generation_failed") {
+    return (
+      <Result
+        status="error"
+        title="Plan generation failed"
+        subTitle={
+          plan.generation_error ||
+          "The AI could not produce a valid plan. Try again, and refine the ticket details if it keeps failing."
+        }
+        extra={[
+          <Button key="retry" type="primary" onClick={() => navigate("/generate")}>
+            Try again
+          </Button>,
+          <Button key="back" onClick={() => navigate("/plans")}>
+            ← Back to plans
+          </Button>,
+        ]}
+      />
+    );
+  }
 
   const p = plan.plan_json;
   const status = plan.status;

@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.connectors.sfdx import parse_sfdx_project
-from app.core.database import get_db
+from app.core.database import AsyncSessionLocal, get_db
 from app.llm.base import ImageInput
 from app.llm.factory import get_llm_provider
 from app.models.connection import CHECKLIST as CHECKLIST_CONN_TYPE
@@ -315,13 +315,16 @@ def _resolve_layout_edits_live(plan_dict: dict, connector) -> tuple[dict, bool]:
     return plan_dict, changed
 
 
-async def _run_generation(
+async def _generate_plan_body(
     db: AsyncSession,
-    user: User,
     ctx: PlanningContext,
-    images: list[ImageInput] | None = None,
-) -> PlanOut:
-    """Shared plan-generation pipeline for JSON and multipart entrypoints."""
+    images: list[ImageInput] | None,
+):
+    """Run the LLM pipeline and return ``(plan, plan_dict, provider)``.
+
+    Raises ``HTTPException`` on provider unavailability so the synchronous
+    entrypoints can surface it before a pending record is created.
+    """
     try:
         provider = get_llm_provider()
     except Exception as exc:  # noqa: BLE001
@@ -346,35 +349,87 @@ async def _run_generation(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Guide retrieval failed: %s", exc)
 
-    try:
-        plan, plan_dict = await generate_plan(
-            provider, ctx, guide_context, images=images
-        )
-    except PlanGenerationError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": str(exc),
-                "attempts": exc.attempts,
-                "errors": exc.last_errors,
-            },
-        )
-
+    plan, plan_dict = await generate_plan(
+        provider, ctx, guide_context, images=images
+    )
     plan_dict = _resolve_layout_edits(plan_dict, ctx)
+    return plan, plan_dict, provider
+
+
+async def _run_generation_background(
+    plan_id: int,
+    ctx: PlanningContext,
+    images: list[ImageInput] | None = None,
+) -> None:
+    """Generate a plan in the background and update the pending record.
+
+    Runs with its own DB session (the request session is closed once the
+    endpoint returns). On success the record moves to ``generated``; on failure
+    it moves to ``generation_failed`` with ``generation_error`` set so the UI
+    can show why instead of leaving the plan stuck as ``generating``.
+    """
+    async with AsyncSessionLocal() as db:
+        record = await db.get(PlanModel, plan_id)
+        if record is None:
+            logger.warning("Background generation: plan %s vanished", plan_id)
+            return
+        try:
+            plan, plan_dict, provider = await _generate_plan_body(db, ctx, images)
+        except PlanGenerationError as exc:
+            record.status = PlanStatus.GENERATION_FAILED
+            record.generation_error = str(exc)
+            await db.commit()
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Background generation failed for plan %s", plan_id)
+            record.status = PlanStatus.GENERATION_FAILED
+            record.generation_error = f"Generation failed: {exc}"
+            await db.commit()
+            return
+
+        record.jira_ticket = plan.jira_ticket
+        record.summary = plan.summary
+        record.status = PlanStatus.GENERATED
+        record.provider = provider.name
+        record.model = getattr(provider, "_model", None)
+        record.plan_json = plan_dict
+        record.generation_error = None
+        await db.commit()
+
+
+async def _start_generation(
+    db: AsyncSession,
+    user: User,
+    ctx: PlanningContext,
+    images: list[ImageInput] | None = None,
+) -> PlanOut:
+    """Create a pending plan and kick off background generation.
+
+    Returns the pending ``PlanOut`` (status ``generating``) immediately so the
+    HTTP request never outlives the preview gateway timeout. The frontend polls
+    the plan until it reaches ``generated`` or ``generation_failed``.
+    """
+    # Fail fast if the provider can't be constructed, so the user gets an
+    # immediate error rather than a pending plan that will never complete.
+    try:
+        get_llm_provider()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"LLM provider unavailable: {exc}")
 
     record = PlanModel(
         user_id=user.id,
-        jira_ticket=plan.jira_ticket,
-        summary=plan.summary,
-        status="generated",
-        provider=provider.name,
-        model=getattr(provider, "_model", None),
+        jira_ticket=ctx.jira_ticket_id or "PENDING",
+        summary=ctx.jira_summary or None,
+        status=PlanStatus.GENERATING,
         context_snapshot=ctx.model_dump(),
-        plan_json=plan_dict,
+        plan_json={},
     )
     db.add(record)
     await db.commit()
     await db.refresh(record)
+
+    # Detach from the request lifecycle: the task owns its own DB session.
+    asyncio.create_task(_run_generation_background(record.id, ctx, images))
     return PlanOut.model_validate(record)
 
 
@@ -418,7 +473,7 @@ async def generate(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> PlanOut:
-    return await _run_generation(db, user, payload.context)
+    return await _start_generation(db, user, payload.context)
 
 
 @router.post("/generate-with-images", response_model=PlanOut)
@@ -439,7 +494,7 @@ async def generate_with_images(
         raise HTTPException(status_code=422, detail=f"Invalid context: {exc}")
 
     images = await _read_image_uploads(files)
-    return await _run_generation(db, user, ctx, images=images or None)
+    return await _start_generation(db, user, ctx, images=images or None)
 
 
 @router.get("/plans", response_model=list[PlanSummaryOut])

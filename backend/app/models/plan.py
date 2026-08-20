@@ -12,6 +12,10 @@ from app.core.database import Base
 class PlanStatus:
     """Plan lifecycle states. Free-text in the DB; centralized here for reuse."""
 
+    # Async generation runs in the background so the HTTP request returns
+    # immediately (long LLM calls otherwise exceed the preview gateway timeout).
+    GENERATING = "generating"
+    GENERATION_FAILED = "generation_failed"
     GENERATED = "generated"
     APPROVED = "approved"
     DEPLOYING = "deploying"
@@ -61,3 +65,6 @@ class Plan(Base):
     )
     # Structured result from checkDeployStatus (success flag, component errors).
     deploy_result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Populated when background generation fails (status == generation_failed),
+    # so the UI can show why instead of leaving the plan stuck as "generating".
+    generation_error: Mapped[str | None] = mapped_column(Text, nullable=True)

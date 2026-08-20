@@ -119,11 +119,15 @@ export default function GeneratePage() {
       const files = designFiles
         .map((f) => f.originFileObj as File | undefined)
         .filter((f): f is File => !!f);
+      // Generation runs in the background: the API returns a pending plan
+      // (status "generating") immediately, and PlanDetailPage polls until it
+      // is ready. This avoids the preview gateway aborting the long LLM call
+      // and showing a false failure while the plan actually succeeds.
       const plan =
         files.length > 0
           ? await planningApi.generateWithImages(ctx, files)
           : await planningApi.generate(ctx);
-      message.success("Plan generated");
+      message.success("Generating plan…");
       navigate(`/plans/${plan.id}`, {
         state: checklistConnId ? { checklistConnId } : undefined,
       });

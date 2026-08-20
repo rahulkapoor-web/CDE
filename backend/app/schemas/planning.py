@@ -89,6 +89,7 @@ class PlanOut(BaseModel):
     deploy_started_at: datetime | None = None
     deploy_finished_at: datetime | None = None
     deploy_result: dict | None = None
+    generation_error: str | None = None
 
     class Config:
         from_attributes = True

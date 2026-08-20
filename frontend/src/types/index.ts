@@ -164,6 +164,7 @@ export interface Plan {
   deploy_started_at?: string | null;
   deploy_finished_at?: string | null;
   deploy_result?: DeployResult | null;
+  generation_error?: string | null;
 }
 
 export interface GithubCommitResult {
