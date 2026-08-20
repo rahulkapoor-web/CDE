@@ -115,23 +115,35 @@ def test_testing_requirements_extra_keys_folded_and_coverage_alias():
     assert "notes" in tr.regression_areas
 
 
-def test_deployment_sequence_as_string_falls_back_to_sandbox():
+def test_deployment_sequence_as_string_falls_back_to_org():
     data = _base_plan()
-    data["deployment_sequence"] = "Deploy to sandbox, validate, then production."
+    data["deployment_sequence"] = "Deploy to the connected org, then validate."
     plan = _assert_valid(data)
-    assert plan.deployment_sequence.sandbox_steps == [1, 2]
-    assert plan.deployment_sequence.production_steps == []
+    assert plan.deployment_sequence.org_steps == [1, 2]
+    assert plan.deployment_sequence.github_actions_steps == []
 
 
 def test_deployment_sequence_string_step_numbers_coerced_to_int():
     data = _base_plan()
     data["deployment_sequence"] = {
-        "sandbox_steps": ["1", "2"],
-        "production_steps": [],
+        "org_steps": ["1", "2"],
         "github_actions_steps": [],
     }
     plan = _assert_valid(data)
-    assert plan.deployment_sequence.sandbox_steps == [1, 2]
+    assert plan.deployment_sequence.org_steps == [1, 2]
+
+
+def test_deployment_sequence_legacy_keys_map_to_org_steps():
+    # Models may still emit sandbox_steps/production_steps; both fold into
+    # org_steps (de-duplicated, order preserved).
+    data = _base_plan()
+    data["deployment_sequence"] = {
+        "sandbox_steps": [1],
+        "production_steps": [1, 2],
+        "github_actions_steps": [],
+    }
+    plan = _assert_valid(data)
+    assert plan.deployment_sequence.org_steps == [1, 2]
 
 
 def test_open_questions_as_objects_flattened_to_strings():
@@ -225,6 +237,27 @@ def test_non_dict_input_returned_unchanged():
     assert coerce_plan_data([1, 2, 3]) == [1, 2, 3]
 
 
+def test_assumed_prerequisites_defaulted_when_missing():
+    """A model that omits assumed_prerequisites still passes the now-required key."""
+    data = _base_plan()
+    assert "assumed_prerequisites" not in data
+    plan = _assert_valid(data)
+    assert plan.assumed_prerequisites == []
+
+
+def test_assumed_prerequisites_object_items_flattened():
+    data = _base_plan()
+    data["assumed_prerequisites"] = [
+        {"text": "Health Cloud is provisioned"},
+        "Account object exists",
+    ]
+    plan = _assert_valid(data)
+    assert plan.assumed_prerequisites == [
+        "Health Cloud is provisioned",
+        "Account object exists",
+    ]
+
+
 def test_combined_drift_all_patterns_at_once():
     """The exact combination seen failing repeatedly in the logs."""
     data = _base_plan()
@@ -234,6 +267,6 @@ def test_combined_drift_all_patterns_at_once():
     data["lsc_guide_references"] = ["Module A", "Module B"]
     plan = _assert_valid(data)
     assert plan.testing_requirements.minimum_code_coverage == 75
-    assert plan.deployment_sequence.sandbox_steps == [1, 2]
+    assert plan.deployment_sequence.org_steps == [1, 2]
     assert plan.open_questions == ["Q1", "Q2"]
     assert plan.lsc_guide_references[0].module == "Module A"

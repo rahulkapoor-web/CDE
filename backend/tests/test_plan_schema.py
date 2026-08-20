@@ -21,27 +21,32 @@ def test_missing_test_step_is_flagged(valid_plan_dict):
         s for s in valid_plan_dict["steps"] if s["type"] != "Test"
     ]
     # Fix deployment sequence to only reference remaining steps.
-    valid_plan_dict["deployment_sequence"]["sandbox_steps"] = [1]
+    valid_plan_dict["deployment_sequence"]["org_steps"] = [1]
     plan = Plan.model_validate(valid_plan_dict)
     errors = validate_business_rules(plan)
     assert any("at least one step of type 'Test'" in e for e in errors)
 
 
-def test_production_without_sandbox_is_flagged(valid_plan_dict):
-    valid_plan_dict["deployment_sequence"]["sandbox_steps"] = []
-    plan = Plan.model_validate(valid_plan_dict)
-    errors = validate_business_rules(plan)
-    assert any("no sandbox steps" in e for e in errors)
-
-
 def test_high_risk_step_requires_rollback(valid_plan_dict):
-    # Remove rollback from the Deploy (production) step.
+    # Remove rollback from the destructive Deploy step.
     for s in valid_plan_dict["steps"]:
         if s["type"] == "Deploy":
             s["rollback"] = None
     plan = Plan.model_validate(valid_plan_dict)
     errors = validate_business_rules(plan)
     assert any("requires a" in e and "rollback" in e for e in errors)
+
+
+def test_test_step_does_not_require_rollback(valid_plan_dict):
+    # A read-only Test step never mutates the org, so it must not be flagged as
+    # high-risk (regression: an env-based rule forced Test steps to carry a
+    # rollback, making generation fail on every retry).
+    for s in valid_plan_dict["steps"]:
+        if s["type"] == "Test":
+            s["rollback"] = None
+    plan = Plan.model_validate(valid_plan_dict)
+    errors = validate_business_rules(plan)
+    assert not any("requires a" in e and "rollback" in e for e in errors)
 
 
 def test_forward_dependency_is_flagged(valid_plan_dict):
@@ -59,7 +64,7 @@ def test_unknown_dependency_is_flagged(valid_plan_dict):
 
 
 def test_deployment_sequence_unknown_step_flagged(valid_plan_dict):
-    valid_plan_dict["deployment_sequence"]["production_steps"] = [42]
+    valid_plan_dict["deployment_sequence"]["org_steps"] = [42]
     plan = Plan.model_validate(valid_plan_dict)
     errors = validate_business_rules(plan)
     assert any("unknown step 42" in e for e in errors)

@@ -37,6 +37,9 @@ export default function GeneratePage() {
   const [gathering, setGathering] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [designFiles, setDesignFiles] = useState<UploadFile[]>([]);
+  // Chosen at gather time; not part of the context. Carried to the plan page so
+  // the plan can be reviewed against it after generation.
+  const [checklistConnId, setChecklistConnId] = useState<number | null>(null);
   const [gatherForm] = Form.useForm();
   const [ctxForm] = Form.useForm();
 
@@ -52,12 +55,36 @@ export default function GeneratePage() {
   async function onGather() {
     const values = await gatherForm.validateFields().catch(() => null);
     if (!values) return;
+    // checklist selection is not a gather-context input; keep it client-side.
+    const { checklist_connection_id, ...gatherValues } = values;
+    setChecklistConnId(
+      checklist_connection_id != null ? Number(checklist_connection_id) : null,
+    );
     setGathering(true);
     try {
-      const ctx = await planningApi.gatherContext(values);
+      const ctx = await planningApi.gatherContext(gatherValues);
       setContext(ctx);
       ctxForm.setFieldsValue(toFormValues(ctx));
-      message.success("Context gathered — review and edit below");
+      // Surface JIRA image attachments in the existing upload area as
+      // done-status entries with data-URL thumbnails. They flow to the backend
+      // via the context (not as multipart), so they carry no originFileObj.
+      const jiraEntries: UploadFile[] = (ctx.jira_images || []).map((img, i) => ({
+        uid: `jira-${i}`,
+        name: img.filename,
+        status: "done" as const,
+        url: `data:${img.media_type};base64,${img.data}`,
+        thumbUrl: `data:${img.media_type};base64,${img.data}`,
+      }));
+      setDesignFiles((prev) => [
+        ...jiraEntries,
+        ...prev.filter((f) => !f.uid.startsWith("jira-")),
+      ]);
+      const count = jiraEntries.length;
+      message.success(
+        count > 0
+          ? `Context gathered — ${count} JIRA image${count === 1 ? "" : "s"} attached. Review and edit below.`
+          : "Context gathered — review and edit below",
+      );
     } catch {
       message.error("Failed to gather context");
     } finally {
@@ -70,6 +97,13 @@ export default function GeneratePage() {
     setGenerating(true);
     try {
       const ctx = fromFormValues(values);
+      // jira_images and existing_layouts are not form fields; carry them from
+      // the gathered context so the backend still receives the ticket's
+      // attachments AND the org's real layout XML on generate. Without the
+      // latter, layout_edits cannot be merged into the real layout and the
+      // deploy fails ("must contain an item for required layout field: Name").
+      ctx.jira_images = context?.jira_images ?? [];
+      ctx.existing_layouts = context?.existing_layouts ?? {};
       const files = designFiles
         .map((f) => f.originFileObj as File | undefined)
         .filter((f): f is File => !!f);
@@ -78,7 +112,9 @@ export default function GeneratePage() {
           ? await planningApi.generateWithImages(ctx, files)
           : await planningApi.generate(ctx);
       message.success("Plan generated");
-      navigate(`/plans/${plan.id}`);
+      navigate(`/plans/${plan.id}`, {
+        state: checklistConnId ? { checklistConnId } : undefined,
+      });
     } catch (e: unknown) {
       const detail = extractError(e);
       message.error(detail);
@@ -122,6 +158,16 @@ export default function GeneratePage() {
             </Form.Item>
             <Form.Item name="sfdx_path" label="SFDX project path (optional)">
               <Input placeholder="/path/to/sfdx-project" />
+            </Form.Item>
+            <Form.Item
+              name="checklist_connection_id"
+              label="Review checklist (optional)"
+            >
+              <Select
+                allowClear
+                options={byType("checklist")}
+                placeholder="Select a checklist to review against"
+              />
             </Form.Item>
             <Button type="primary" block loading={gathering} onClick={onGather}>
               Gather Context
@@ -285,6 +331,8 @@ function fromFormValues(values: Record<string, unknown>): PlanningContext {
   listFields.forEach((f) => {
     if (!out[f]) out[f] = [];
   });
+  if (!out.jira_images) out.jira_images = [];
+  if (!out.existing_layouts) out.existing_layouts = {};
   const stringFields = [
     "jira_ticket_id",
     "jira_summary",

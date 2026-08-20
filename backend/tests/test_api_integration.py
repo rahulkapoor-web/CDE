@@ -506,3 +506,429 @@ async def test_check_only_deploy_does_not_change_status(
     # Dry run reports a result but leaves the plan approved (not deployed).
     assert body["status"] == "approved"
     assert body["deploy_result"]["check_only"] is True
+
+
+class RefiningProvider(FakeProvider):
+    """Returns the base plan first, then a modified plan on the refine call."""
+
+    def __init__(self, first: dict, second: dict):
+        super().__init__(first)
+        self._second = second
+        self._calls = 0
+        self.last_refine_prompt = None
+
+    async def complete(self, system_prompt, user_prompt, **kwargs):
+        self._calls += 1
+        if self._calls == 1:
+            return LLMResult(
+                text=json.dumps(self._plan), model="m", provider=self.name
+            )
+        self.last_refine_prompt = user_prompt
+        return LLMResult(
+            text=json.dumps(self._second), model="m", provider=self.name
+        )
+
+    async def embed(self, texts):
+        raise NotImplementedError
+
+
+@pytest.mark.asyncio
+async def test_refine_revises_plan_and_resets_lifecycle(
+    client, valid_plan_dict, monkeypatch
+):
+    import copy
+
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    first = _plan_dict_with_artifact(valid_plan_dict)
+    second = copy.deepcopy(first)
+    second["summary"] = "Refined: only the field, no extra rule."
+
+    provider = RefiningProvider(first, second)
+    monkeypatch.setattr(planning_route, "get_llm_provider", lambda: provider)
+
+    plan_id = await _generate_plan(client, headers)
+
+    # Approve first so we can prove refine resets the lifecycle.
+    r = await client.post(f"/api/planning/plans/{plan_id}/approve", headers=headers)
+    assert r.json()["status"] == "approved"
+
+    # Empty feedback is rejected.
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/refine",
+        headers=headers,
+        json={"feedback": "   "},
+    )
+    assert r.status_code == 422
+
+    # Refine with real feedback.
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/refine",
+        headers=headers,
+        json={"feedback": "Drop the validation rule; keep only the field."},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "generated"  # reset for re-review
+    assert body["approved_at"] is None
+    assert body["plan_json"]["summary"].startswith("Refined:")
+    # The refine prompt carried the reviewer feedback and the current plan.
+    assert "Drop the validation rule" in provider.last_refine_prompt
+    assert "CURRENT PLAN JSON" in provider.last_refine_prompt
+
+
+async def _create_gh_connection(client, headers) -> int:
+    r = await client.post(
+        "/api/connections",
+        headers=headers,
+        json={
+            "name": "GH",
+            "conn_type": "github",
+            "config": {"repo": "o/r", "metadata_format": "sfdx"},
+            "secrets": {"token": "ghtoken"},
+        },
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_commit_to_github_requires_approval(
+    client, valid_plan_dict, monkeypatch
+):
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    plan_dict = _plan_dict_with_artifact(valid_plan_dict)
+    monkeypatch.setattr(
+        planning_route, "get_llm_provider", lambda: FakeProvider(plan_dict)
+    )
+    plan_id = await _generate_plan(client, headers)
+    gh_id = await _create_gh_connection(client, headers)
+
+    # Not approved yet -> 409.
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/commit-github",
+        headers=headers,
+        json={"github_connection_id": gh_id},
+    )
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_commit_to_github_success(client, valid_plan_dict, monkeypatch):
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+    from app.connectors.github import CommitResult
+
+    plan_dict = _plan_dict_with_artifact(valid_plan_dict)
+    monkeypatch.setattr(
+        planning_route, "get_llm_provider", lambda: FakeProvider(plan_dict)
+    )
+    plan_id = await _generate_plan(client, headers)
+    gh_id = await _create_gh_connection(client, headers)
+    await client.post(f"/api/planning/plans/{plan_id}/approve", headers=headers)
+
+    captured = {}
+
+    class _GH:
+        async def detect_format(self, base):
+            return "mdapi"
+
+        async def commit_files(self, files, *, branch, message, base_branch=None):
+            captured["files"] = files
+            captured["branch"] = branch
+            return CommitResult(
+                branch=branch,
+                commit_sha="abc1234def",
+                commit_url="https://github.com/o/r/commit/abc1234def",
+                branch_url=f"https://github.com/o/r/tree/{branch}",
+                files=[p for p, _ in files],
+                created_branch=True,
+            )
+
+    monkeypatch.setattr(
+        planning_route, "github_from_connection", lambda conn, repo=None: _GH()
+    )
+
+    # Explicit format overrides the connection/detection.
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/commit-github",
+        headers=headers,
+        json={"github_connection_id": gh_id, "metadata_format": "sfdx"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["metadata_format"] == "sfdx"
+    assert body["created_branch"] is True
+    assert body["commit_sha"] == "abc1234def"
+    assert body["files"]
+    # The fixture already uses a source-format (-meta.xml) path, which is
+    # preserved on commit.
+    assert any("ACV__c.field-meta.xml" in f for f in body["files"])
+    assert captured["branch"].startswith("ona/")
+
+
+@pytest.mark.asyncio
+async def test_commit_to_github_rejects_non_github_connection(
+    client, valid_plan_dict, monkeypatch
+):
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    plan_dict = _plan_dict_with_artifact(valid_plan_dict)
+    monkeypatch.setattr(
+        planning_route, "get_llm_provider", lambda: FakeProvider(plan_dict)
+    )
+    plan_id = await _generate_plan(client, headers)
+    sf_id = await _create_sf_connection(client, headers)
+    await client.post(f"/api/planning/plans/{plan_id}/approve", headers=headers)
+
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/commit-github",
+        headers=headers,
+        json={"github_connection_id": sf_id},
+    )
+    assert r.status_code == 400
+
+
+async def _create_jira_connection(client, headers) -> int:
+    r = await client.post(
+        "/api/connections",
+        headers=headers,
+        json={
+            "name": "JIRA",
+            "conn_type": "jira",
+            "config": {"base_url": "https://x.atlassian.net", "email": "e@x.com"},
+            "secrets": {"api_token": "tok"},
+        },
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+async def _create_checklist_connection(client, headers, content) -> int:
+    r = await client.post(
+        "/api/connections",
+        headers=headers,
+        json={
+            "name": "LSC checklist",
+            "conn_type": "checklist",
+            "config": {"content": content},
+            "secrets": {},
+        },
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_post_test_plan_to_jira(client, valid_plan_dict, monkeypatch):
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    monkeypatch.setattr(
+        planning_route, "get_llm_provider", lambda: FakeProvider(valid_plan_dict)
+    )
+    plan_id = await _generate_plan(client, headers)
+    jira_id = await _create_jira_connection(client, headers)
+
+    captured = {}
+
+    class _FakeJira:
+        async def add_comment(self, ticket_id, body):
+            captured["ticket_id"] = ticket_id
+            captured["body"] = body
+            return {"id": "999", "url": f"https://x/browse/{ticket_id}"}
+
+    monkeypatch.setattr(
+        planning_route, "jira_from_connection", lambda conn: _FakeJira()
+    )
+
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/post-test-plan-jira",
+        headers=headers,
+        json={"jira_connection_id": jira_id},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["comment_id"] == "999"
+    # The posted body contains the plan's unit test content.
+    assert "Unit Test Plan" in captured["body"]
+
+
+@pytest.mark.asyncio
+async def test_post_test_plan_rejects_non_jira_connection(
+    client, valid_plan_dict, monkeypatch
+):
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    monkeypatch.setattr(
+        planning_route, "get_llm_provider", lambda: FakeProvider(valid_plan_dict)
+    )
+    plan_id = await _generate_plan(client, headers)
+    sf_id = await _create_sf_connection(client, headers)
+
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/post-test-plan-jira",
+        headers=headers,
+        json={"jira_connection_id": sf_id},
+    )
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_review_against_checklist(client, valid_plan_dict, monkeypatch):
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    monkeypatch.setattr(
+        planning_route, "get_llm_provider", lambda: FakeProvider(valid_plan_dict)
+    )
+    plan_id = await _generate_plan(client, headers)
+    checklist_id = await _create_checklist_connection(
+        client, headers, "- All fields have FLS\n- No hardcoded IDs"
+    )
+
+    async def _fake_review(provider, plan_json, checklist_text):
+        return {
+            "overall": "partial",
+            "summary": "one gap",
+            "results": [
+                {"item": "All fields have FLS", "status": "pass", "finding": "ok"},
+                {"item": "No hardcoded IDs", "status": "fail", "finding": "found"},
+            ],
+        }
+
+    monkeypatch.setattr(
+        planning_route, "review_plan_against_checklist", _fake_review
+    )
+
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/review-checklist",
+        headers=headers,
+        json={"checklist_connection_id": checklist_id},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["overall"] == "partial"
+    assert body["checklist_name"] == "LSC checklist"
+    assert len(body["results"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_review_rejects_empty_checklist(
+    client, valid_plan_dict, monkeypatch
+):
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    monkeypatch.setattr(
+        planning_route, "get_llm_provider", lambda: FakeProvider(valid_plan_dict)
+    )
+    plan_id = await _generate_plan(client, headers)
+    checklist_id = await _create_checklist_connection(client, headers, "   ")
+
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/review-checklist",
+        headers=headers,
+        json={"checklist_connection_id": checklist_id},
+    )
+    assert r.status_code == 422
+
+
+class _FakeSfConnector:
+    is_sandbox = True
+
+    def connect(self):
+        return object()
+
+    def list_layouts(self, object_names=None):
+        return []
+
+    def fetch_layouts(self, names, api_version="60.0"):
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_deploy_with_step_subset(client, valid_plan_dict, monkeypatch):
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    plan_dict = _plan_dict_with_artifact(valid_plan_dict)
+    monkeypatch.setattr(
+        planning_route, "get_llm_provider", lambda: FakeProvider(plan_dict)
+    )
+    plan_id = await _generate_plan(client, headers)
+    conn_id = await _create_sf_connection(client, headers)
+    await client.post(f"/api/planning/plans/{plan_id}/approve", headers=headers)
+
+    monkeypatch.setattr(
+        planning_route,
+        "salesforce_from_connection",
+        lambda conn: _FakeSfConnector(),
+    )
+
+    captured = {}
+
+    def _fake_deploy(sf, plan_schema, *, is_sandbox, check_only=False, **kw):
+        from app.services.deployer import build_package_zip
+
+        pkg = build_package_zip(plan_schema)
+        captured["files"] = pkg.file_paths
+        return ("ASYNC1", {"succeeded": True, "state": "Succeeded"})
+
+    monkeypatch.setattr(planning_route, "deploy_plan", _fake_deploy)
+
+    # Select only step 1 + its file.
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/deploy",
+        headers=headers,
+        json={
+            "salesforce_connection_id": conn_id,
+            "check_only": True,
+            "step_numbers": [1],
+            "artifact_paths": [
+                "objects/Account/fields/ACV__c.field-meta.xml"
+            ],
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert captured["files"] == [
+        "objects/Account/fields/ACV__c.field-meta.xml"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deploy_empty_selection_returns_422(
+    client, valid_plan_dict, monkeypatch
+):
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    plan_dict = _plan_dict_with_artifact(valid_plan_dict)
+    monkeypatch.setattr(
+        planning_route, "get_llm_provider", lambda: FakeProvider(plan_dict)
+    )
+    plan_id = await _generate_plan(client, headers)
+    conn_id = await _create_sf_connection(client, headers)
+    await client.post(f"/api/planning/plans/{plan_id}/approve", headers=headers)
+
+    monkeypatch.setattr(
+        planning_route,
+        "salesforce_from_connection",
+        lambda conn: _FakeSfConnector(),
+    )
+
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/deploy",
+        headers=headers,
+        json={
+            "salesforce_connection_id": conn_id,
+            "check_only": True,
+            "step_numbers": [],
+            "artifact_paths": [],
+        },
+    )
+    assert r.status_code == 422

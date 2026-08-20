@@ -49,6 +49,7 @@ _COVERAGE_ALIASES = {
 
 _STRING_LIST_FIELDS = (
     "prerequisites",
+    "assumed_prerequisites",
     "post_deployment",
     "open_questions",
     "copilot_suggested_actions",
@@ -164,24 +165,43 @@ def _coerce_testing_requirements(value: Any) -> Any:
     return result
 
 
+def _coerce_environment(value: Any) -> Any:
+    """Map any environment value onto the connected-org model.
+
+    Development targets the connected (Dev) org; the CI/CD pipeline promotes
+    changes downstream. Legacy values (Sandbox/Production/Both) collapse to
+    ``Org``; a commit target stays ``GitHub``.
+    """
+    if not isinstance(value, str):
+        return value
+    return "GitHub" if value.strip().lower() == "github" else "Org"
+
+
 def _coerce_deployment_sequence(value: Any, step_numbers: list[int]) -> Any:
-    """Return an object with the three canonical integer-list keys."""
-    canonical_keys = ("sandbox_steps", "production_steps", "github_actions_steps")
+    """Return an object with the canonical keys: org_steps, github_actions_steps."""
+    # Legacy/alias keys some models still emit, all mapped onto org_steps.
+    org_aliases = ("org_steps", "sandbox_steps", "production_steps")
 
     if isinstance(value, dict):
-        result: dict[str, Any] = {}
-        for key in canonical_keys:
-            result[key] = _int_list(value.get(key, []) or [])
-        return result
+        org_steps: list[int] = []
+        for key in org_aliases:
+            org_steps.extend(_int_list(value.get(key, []) or []))
+        # De-duplicate while preserving order.
+        seen: set[int] = set()
+        org_steps = [n for n in org_steps if not (n in seen or seen.add(n))]
+        return {
+            "org_steps": org_steps,
+            "github_actions_steps": _int_list(
+                value.get("github_actions_steps", []) or []
+            ),
+        }
 
-    # A string or list description we cannot reliably parse into three ordered
-    # buckets. Fall back to a safe default: everything runs in sandbox first,
-    # nothing auto-promoted to production, so downstream business rules stay
-    # consistent. This keeps generation succeeding instead of hard-failing.
+    # A string or list description we cannot reliably parse into buckets. Fall
+    # back to a safe default: every step runs against the connected org. This
+    # keeps generation succeeding instead of hard-failing.
     if isinstance(value, (str, list)) or value is None:
         return {
-            "sandbox_steps": list(step_numbers),
-            "production_steps": [],
+            "org_steps": list(step_numbers),
             "github_actions_steps": [],
         }
     return value
@@ -290,6 +310,48 @@ def _coerce_metadata_artifact(value: Any) -> Any:
     return result
 
 
+def _coerce_layout_edits(value: Any) -> list:
+    """Normalize a step's layout_edits into the canonical list-of-objects shape.
+
+    Drops malformed entries; missing/other types -> []. Each edit needs a
+    layout_name and a list of add_fields (each with a ``field``).
+    """
+    if not isinstance(value, list):
+        return []
+    out: list[dict] = []
+    for edit in value:
+        if not isinstance(edit, dict):
+            continue
+        name = edit.get("layout_name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        raw_fields = edit.get("add_fields")
+        clean_fields: list[dict] = []
+        if isinstance(raw_fields, list):
+            for fld in raw_fields:
+                if isinstance(fld, str) and fld.strip():
+                    clean_fields.append({"field": fld.strip(), "behavior": "Edit"})
+                    continue
+                if not isinstance(fld, dict):
+                    continue
+                api = fld.get("field")
+                if not isinstance(api, str) or not api.strip():
+                    continue
+                item: dict = {"field": api.strip()}
+                section = fld.get("section")
+                item["section"] = section if isinstance(section, str) else None
+                behavior = fld.get("behavior")
+                item["behavior"] = (
+                    behavior if isinstance(behavior, str) and behavior.strip()
+                    else "Edit"
+                )
+                clean_fields.append(item)
+        if not clean_fields:
+            continue
+        out.append({"layout_name": name.strip(), "add_fields": clean_fields})
+    return out
+
+
 def coerce_plan_data(data: Any) -> Any:
     """Best-effort normalization of a decoded plan dict.
 
@@ -310,12 +372,17 @@ def coerce_plan_data(data: Any) -> Any:
                 n = _as_int(step.get("step_number"))
                 if n is not None:
                     step_numbers.append(n)
+                if "environment" in step:
+                    step["environment"] = _coerce_environment(step["environment"])
                 if "dependencies" in step:
                     step["dependencies"] = _int_list(step["dependencies"])
                 if "metadata_artifact" in step:
                     step["metadata_artifact"] = _coerce_metadata_artifact(
                         step["metadata_artifact"]
                     )
+                step["layout_edits"] = _coerce_layout_edits(
+                    step.get("layout_edits")
+                )
 
     if "testing_requirements" in data:
         data["testing_requirements"] = _coerce_testing_requirements(
@@ -330,6 +397,10 @@ def coerce_plan_data(data: Any) -> Any:
         data["lsc_guide_references"] = [
             _coerce_lsc_reference(item) for item in data["lsc_guide_references"]
         ]
+
+    # assumed_prerequisites was added after some prompts/fixtures; default it so
+    # older or terse model output still satisfies the now-required schema key.
+    data.setdefault("assumed_prerequisites", [])
 
     for field in _STRING_LIST_FIELDS:
         if field in data:

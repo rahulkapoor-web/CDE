@@ -30,6 +30,24 @@ def build_user_prompt(
         'write "Verify in LSC Configuration Guide: [topic]".\n'
     )
 
+    layout_block = ""
+    if ctx.existing_layouts:
+        parts = [
+            "\nEXISTING PAGE LAYOUTS (retrieved from the org — use these to "
+            "automate layout changes). When the story requires a field on a "
+            "layout, take the FULL layout XML below, insert the field into the "
+            "appropriate section, and emit the COMPLETE modified layout as "
+            "deployable metadata (type Layout). Preserve all existing sections, "
+            "columns, and fields — never drop anything. Do NOT make this a "
+            "manual step.\n"
+        ]
+        for full_name, xml in ctx.existing_layouts.items():
+            parts.append(
+                f"\n--- Layout fullName: {full_name} "
+                f"(file path: layouts/{full_name}.layout) ---\n{xml}\n"
+            )
+        layout_block = "".join(parts)
+
     design_block = (
         "\nDESIGN REFERENCE: One or more UI design images (e.g. a Figma export) "
         "are attached. Treat them as the target UI. Derive required fields, "
@@ -71,6 +89,6 @@ GitHub Repo State:
 {_bullets(ctx.github_recent_commits)}
   - Open PRs:
 {_bullets(ctx.github_open_prs)}
-{guide_block}{design_block}
+{guide_block}{layout_block}{design_block}
 Use plan_id = "{plan_id}" and jira_ticket = "{ctx.jira_ticket_id}".
 Return ONLY the JSON object, with no surrounding text or code fences."""

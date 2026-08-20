@@ -15,14 +15,61 @@ Supported ``auth_flow`` values:
   - ``access_token``: pre-obtained access_token + instance_url (no token call).
 """
 
+import io
 import logging
 import time
+import zipfile
+from base64 import b64decode
+from xml.sax.saxutils import escape
 
 import httpx
+
+from app.services.target_detection import detect_target_objects
 
 logger = logging.getLogger(__name__)
 
 _OAUTH_FLOWS = {"client_credentials", "password", "jwt_bearer", "access_token"}
+
+_MD_NS = {
+    "soapenv": "http://schemas.xmlsoap.org/soap/envelope/",
+    "mt": "http://soap.sforce.com/2006/04/metadata",
+}
+
+# SOAP envelope to start a Metadata API retrieve for named components.
+_RETRIEVE_MSG = """<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:met="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header><met:SessionHeader><met:sessionId>{session_id}</met:sessionId></met:SessionHeader></soapenv:Header>
+  <soapenv:Body>
+    <met:retrieve><met:retrieveRequest>
+      <met:apiVersion>{api_version}</met:apiVersion>
+      <met:singlePackage>true</met:singlePackage>
+      <met:unpackaged>{types}<met:version>{api_version}</met:version></met:unpackaged>
+    </met:retrieveRequest></met:retrieve>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+
+_CHECK_RETRIEVE_MSG = """<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:met="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header><met:SessionHeader><met:sessionId>{session_id}</met:sessionId></met:SessionHeader></soapenv:Header>
+  <soapenv:Body>
+    <met:checkRetrieveStatus><met:asyncProcessId>{async_id}</met:asyncProcessId><met:includeZip>true</met:includeZip></met:checkRetrieveStatus>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+
+_LIST_METADATA_MSG = """<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:met="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header><met:SessionHeader><met:sessionId>{session_id}</met:sessionId></met:SessionHeader></soapenv:Header>
+  <soapenv:Body>
+    <met:listMetadata><met:queries><met:type>Layout</met:type></met:queries><met:asOfVersion>{api_version}</met:asOfVersion></met:listMetadata>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+
+# Synchronous read of named metadata components (no async retrieve/zip/poll).
+# readMetadata accepts up to 10 fullNames per Layout call and returns each as a
+# <records> element in the response body.
+_READ_METADATA_MSG = """<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:met="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Header><met:SessionHeader><met:sessionId>{session_id}</met:sessionId></met:SessionHeader></soapenv:Header>
+  <soapenv:Body>
+    <met:readMetadata><met:type>Layout</met:type>{full_names}</met:readMetadata>
+  </soapenv:Body>
+</soapenv:Envelope>"""
 
 
 class SalesforceConnector:
@@ -176,8 +223,21 @@ class SalesforceConnector:
             "api_limits": list(limits.keys())[:3],
         }
 
-    def fetch_metadata(self, object_names: list[str] | None = None) -> dict:
-        """Return a metadata snapshot. `object_names` optionally scopes fields."""
+    def fetch_metadata(
+        self,
+        object_names: list[str] | None = None,
+        focus_text: str | None = None,
+    ) -> dict:
+        """Return a metadata snapshot.
+
+        ``object_names`` explicitly scopes which objects to describe. When it is
+        not given, the snapshot defaults to custom + known-LSC objects. If
+        ``focus_text`` (e.g. the JIRA story) is provided, objects the story
+        references — including standard ones like ``Account`` that aren't custom
+        — are pulled to the front of the (capped) field-describe loop so the
+        story's fields are always captured, keeping the snapshot proportional to
+        the change instead of describing arbitrary objects.
+        """
         sf = self.connect()
         describe = sf.describe()
         sobjects = describe.get("sobjects", [])
@@ -188,6 +248,15 @@ class SalesforceConnector:
             for o in sobjects
             if o.get("custom") or o["name"] in _LSC_OBJECT_HINTS
         ]
+
+        # Prioritize story-referenced objects (and include standard targets that
+        # the default custom/LSC filter would miss) so their fields survive the
+        # cap below.
+        if focus_text and not object_names:
+            targets = detect_target_objects(focus_text, all_objects)
+            if targets:
+                ordered = list(dict.fromkeys(targets + objects))
+                objects = ordered
 
         fields: list[str] = []
         for obj in objects[:25]:  # cap to keep snapshots manageable
@@ -221,6 +290,93 @@ class SalesforceConnector:
             "metadata_permission_sets": perms,
         }
 
+    def _metadata_soap_url(self) -> str:
+        # simple-salesforce exposes sf_version on the connected client.
+        version = getattr(self.sf, "sf_version", "60.0")
+        return f"{self.instance_url}/services/Soap/m/{version}/"
+
+    def list_layouts(
+        self, object_names: list[str] | None = None, api_version: str = "60.0"
+    ) -> list[str]:
+        """List Layout full names, optionally filtered to given objects.
+
+        Returns e.g. ``["Account-Account Layout", "Contact-Contact Layout"]``.
+        Best-effort: returns an empty list on failure.
+        """
+        try:
+            self.connect()
+            body = _LIST_METADATA_MSG.format(
+                session_id=self.access_token, api_version=api_version
+            )
+            with httpx.Client(timeout=30, follow_redirects=True) as client:
+                resp = client.post(
+                    self._metadata_soap_url(),
+                    content=body.encode("utf-8"),
+                    headers={
+                        "Content-Type": "text/xml",
+                        "SOAPAction": "listMetadata",
+                    },
+                )
+                resp.raise_for_status()
+            names = _soap_findall_fullnames(resp.text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("listMetadata(Layout) failed: %s", exc)
+            return []
+
+        if object_names:
+            wanted = {o.lower() for o in object_names}
+            names = [n for n in names if n.split("-", 1)[0].lower() in wanted]
+        return names
+
+    def fetch_layouts(
+        self, layout_full_names: list[str], api_version: str = "60.0"
+    ) -> dict[str, str]:
+        """Retrieve existing Layout XML by full name via the Metadata API.
+
+        Uses the SYNCHRONOUS ``readMetadata`` call (not the async retrieve/zip/
+        poll flow, whose queue can stay Pending for minutes on busy orgs). Reads
+        return in well under a second and require no polling. ``readMetadata``
+        accepts up to 10 fullNames per call, so we chunk.
+
+        Returns ``{full_name: layout_xml}`` where each value is a standalone,
+        deployable ``.layout`` document. The full XML lets the planner insert a
+        field into the REAL layout (preserving existing sections/fields, e.g. the
+        required ``Name`` item). Best-effort: on any failure returns an empty
+        dict so context gathering still succeeds.
+        """
+        if not layout_full_names:
+            return {}
+
+        out: dict[str, str] = {}
+        try:
+            self.connect()
+            session_id = self.access_token
+            soap_url = self._metadata_soap_url()
+
+            with httpx.Client(timeout=30, follow_redirects=True) as client:
+                for i in range(0, len(layout_full_names), 10):
+                    chunk = layout_full_names[i : i + 10]
+                    full_names = "".join(
+                        f"<met:fullNames>{escape(n)}</met:fullNames>" for n in chunk
+                    )
+                    body = _READ_METADATA_MSG.format(
+                        session_id=session_id, full_names=full_names
+                    )
+                    resp = client.post(
+                        soap_url,
+                        content=body.encode("utf-8"),
+                        headers={
+                            "Content-Type": "text/xml",
+                            "SOAPAction": "readMetadata",
+                        },
+                    )
+                    resp.raise_for_status()
+                    out.update(_layouts_from_read_response(resp.text))
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Layout read failed: %s", exc)
+            return out
+
 
 _LSC_OBJECT_HINTS = {
     "AccountPlan",
@@ -248,6 +404,83 @@ def _detect_lsc_modules(all_objects: list[str]) -> list[str]:
         if any(any(m in o for o in present) for m in markers):
             modules.append(module)
     return modules
+
+
+def _soap_findtext(xml_text: str, path: str) -> str | None:
+    import xml.etree.ElementTree as ET
+
+    try:
+        return ET.fromstring(xml_text).findtext(path, None, _MD_NS)
+    except ET.ParseError:
+        return None
+
+
+def _soap_findall_fullnames(xml_text: str) -> list[str]:
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    out = []
+    for result in root.iter("{http://soap.sforce.com/2006/04/metadata}result"):
+        fn = result.findtext("mt:fullName", None, _MD_NS)
+        if fn:
+            out.append(fn)
+    return out
+
+
+def _layouts_from_read_response(xml_text: str) -> dict[str, str]:
+    """Convert a readMetadata SOAP response into ``{full_name: layout_xml}``.
+
+    readMetadata returns each layout as a ``<records xsi:type="Layout">`` element
+    containing a ``<fullName>`` plus the layout body. We rebuild each as a
+    standalone, deployable ``<Layout>`` document (namespaced, ``fullName`` and
+    xsi attributes dropped) so it round-trips through the same merge/deploy path
+    as a retrieved ``.layout`` file.
+    """
+    import xml.etree.ElementTree as ET
+
+    ns = "http://soap.sforce.com/2006/04/metadata"
+    out: dict[str, str] = {}
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return out
+
+    for records in root.iter(f"{{{ns}}}records"):
+        full_name = records.findtext(f"{{{ns}}}fullName", None, _MD_NS)
+        if not full_name:
+            continue
+        ET.register_namespace("", ns)
+        layout = ET.Element(f"{{{ns}}}Layout")
+        for child in list(records):
+            tag = child.tag
+            # Skip the fullName element; it is not part of a .layout file body.
+            if tag == f"{{{ns}}}fullName":
+                continue
+            layout.append(child)
+        body = ET.tostring(layout, encoding="unicode")
+        out[full_name] = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n' + body + "\n"
+        )
+    return out
+
+
+def _extract_layouts_from_zip(zip_bytes: bytes) -> dict[str, str]:
+    """Pull layout XML out of a retrieve zip, keyed by layout full name.
+
+    In a singlePackage retrieve, layouts land under ``layouts/<FullName>.layout``.
+    The full name is the file stem (e.g. ``Account-Account Layout``).
+    """
+    out: dict[str, str] = {}
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for name in zf.namelist():
+            norm = name.split("/", 1)[1] if name.startswith("unpackaged/") else name
+            if norm.startswith("layouts/") and norm.endswith(".layout"):
+                full_name = norm[len("layouts/") : -len(".layout")]
+                out[full_name] = zf.read(name).decode("utf-8")
+    return out
 
 
 def _query_names(sf, soql: str, key: str, nested: str | None = None) -> list[str]:

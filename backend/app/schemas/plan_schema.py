@@ -19,6 +19,7 @@ PLAN_JSON_SCHEMA: dict = {
         "estimated_effort",
         "lsc_guide_references",
         "prerequisites",
+        "assumed_prerequisites",
         "steps",
         "testing_requirements",
         "deployment_sequence",
@@ -56,6 +57,7 @@ PLAN_JSON_SCHEMA: dict = {
             },
         },
         "prerequisites": {"type": "array", "items": {"type": "string"}},
+        "assumed_prerequisites": {"type": "array", "items": {"type": "string"}},
         "steps": {
             "type": "array",
             "minItems": 1,
@@ -92,7 +94,7 @@ PLAN_JSON_SCHEMA: dict = {
                     },
                     "environment": {
                         "type": "string",
-                        "enum": ["Sandbox", "Production", "Both", "GitHub"],
+                        "enum": ["Org", "GitHub"],
                     },
                     "description": {"type": "string"},
                     "lsc_guide_reference": {"type": ["string", "null"]},
@@ -126,6 +128,32 @@ PLAN_JSON_SCHEMA: dict = {
                                 },
                             },
                             "api_version": {"type": ["string", "null"]},
+                        },
+                    },
+                    "layout_edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["layout_name", "add_fields"],
+                            "properties": {
+                                "layout_name": {"type": "string"},
+                                "add_fields": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": False,
+                                        "required": ["field"],
+                                        "properties": {
+                                            "field": {"type": "string"},
+                                            "section": {
+                                                "type": ["string", "null"]
+                                            },
+                                            "behavior": {"type": "string"},
+                                        },
+                                    },
+                                },
+                            },
                         },
                     },
                     "acceptance_check": {"type": "string"},
@@ -162,10 +190,9 @@ PLAN_JSON_SCHEMA: dict = {
         "deployment_sequence": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["sandbox_steps", "production_steps", "github_actions_steps"],
+            "required": ["org_steps", "github_actions_steps"],
             "properties": {
-                "sandbox_steps": {"type": "array", "items": {"type": "integer"}},
-                "production_steps": {"type": "array", "items": {"type": "integer"}},
+                "org_steps": {"type": "array", "items": {"type": "integer"}},
                 "github_actions_steps": {
                     "type": "array",
                     "items": {"type": "integer"},

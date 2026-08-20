@@ -204,3 +204,91 @@ def test_token_error_response_raises():
         c.connect()
     assert "OAuth2 token request to" in str(exc.value)
     assert "failed (400)" in str(exc.value)
+
+
+class _ObjDesc:
+    def __init__(self, name: str):
+        self._name = name
+
+    def describe(self) -> dict:
+        return {"fields": [{"name": "Name"}, {"name": f"{self._name}_Custom__c"}]}
+
+
+class _MetaSF:
+    """Fake Salesforce client capturing which objects get a field-describe."""
+
+    def __init__(self, object_names: list[str]):
+        self._object_names = object_names
+        self.described: list[str] = []
+
+    def describe(self) -> dict:
+        return {
+            "organizationType": "Developer Edition",
+            "sobjects": [
+                {"name": n, "custom": n.endswith("__c")} for n in self._object_names
+            ],
+        }
+
+    def query_all(self, *_a, **_k):  # SOQL helpers -> treated as empty
+        return {"records": []}
+
+    def __getattr__(self, item):
+        # getattr(sf, obj).describe() path in fetch_metadata.
+        if item in self._object_names:
+            self.described.append(item)
+            return _ObjDesc(item)
+        raise AttributeError(item)
+
+
+def _connector_with_fake(monkeypatch, fake) -> SalesforceConnector:
+    c = SalesforceConnector(
+        auth_flow="access_token",
+        access_token="T",
+        instance_url="https://acme.my.salesforce.com",
+    )
+    monkeypatch.setattr(c, "connect", lambda: fake)
+    c.sf = fake
+    return c
+
+
+def test_fetch_metadata_focus_text_prioritizes_story_object(monkeypatch):
+    # Many objects; the story references only the standard Account object, which
+    # the default custom/LSC filter would NOT pick up. focus_text must pull it
+    # into the described set so its fields are captured.
+    names = ["Account", "Contact"] + [f"Filler{i}__c" for i in range(40)]
+    fake = _MetaSF(names)
+    c = _connector_with_fake(monkeypatch, fake)
+
+    data = c.fetch_metadata(
+        None, focus_text="Add Specialty field to the Account object"
+    )
+
+    # Account was described (its fields present) despite the 25-object cap.
+    assert "Account" in fake.described
+    assert any(f.startswith("Account.") for f in data["metadata_fields"])
+    # Account is first in the scoped object ordering.
+    assert data["metadata_objects"][0] == "Account"
+
+
+def test_fetch_metadata_without_focus_uses_default_scope(monkeypatch):
+    names = ["Account", "Custom_A__c", "Custom_B__c"]
+    fake = _MetaSF(names)
+    c = _connector_with_fake(monkeypatch, fake)
+
+    data = c.fetch_metadata()
+
+    # Default scope = custom objects only (standard Account excluded here).
+    assert "Custom_A__c" in data["metadata_objects"]
+    assert "Account" not in data["metadata_objects"]
+
+
+def test_fetch_metadata_explicit_object_names_override_focus(monkeypatch):
+    names = ["Account", "Contact", "Visit__c"]
+    fake = _MetaSF(names)
+    c = _connector_with_fake(monkeypatch, fake)
+
+    data = c.fetch_metadata(["Contact"], focus_text="mentions Account only")
+
+    # Explicit object_names win; focus_text is ignored when names are given.
+    assert data["metadata_objects"] == ["Contact"]
+    assert fake.described == ["Contact"]

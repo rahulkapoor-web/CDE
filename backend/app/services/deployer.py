@@ -139,6 +139,84 @@ def build_package_zip(
     )
 
 
+def filter_plan_for_deploy(
+    plan: Plan,
+    step_numbers: list[int] | None = None,
+    artifact_paths: list[str] | None = None,
+) -> Plan:
+    """Return a deep copy of ``plan`` narrowed to a user-selected subset.
+
+    Selection is applied to each step's ``metadata_artifact``:
+
+    * ``step_numbers`` (when not None): steps whose number is absent have their
+      artifact removed entirely, so they contribute no files/members.
+    * ``artifact_paths`` (when not None): within the remaining steps, only files
+      whose path is in the set are kept. Package members are then pruned to the
+      metadata types that still have at least one backing file in that step, so
+      package.xml never lists a type with no deployable file.
+
+    Passing ``None`` for a dimension means "no filtering on that dimension".
+    Passing an empty list means "select nothing" for that dimension. The input
+    plan is not mutated.
+    """
+    filtered = plan.model_copy(deep=True)
+    step_set = set(step_numbers) if step_numbers is not None else None
+    path_set = set(artifact_paths) if artifact_paths is not None else None
+
+    def _norm(p: str) -> str:
+        return p.strip().lstrip("/")
+
+    for step in filtered.steps:
+        art = step.metadata_artifact
+        if not art:
+            continue
+        if step_set is not None and step.step_number not in step_set:
+            step.metadata_artifact = None
+            continue
+        if path_set is not None:
+            kept_files = [f for f in art.files if _norm(f.path) in path_set]
+            art.files = kept_files
+            # Prune members to types that still have a backing file. File paths
+            # follow "<folder>/<Name>.<ext>"; the folder maps to a metadata type
+            # only loosely, so we key on whether ANY file references the member
+            # fullName, falling back to keeping members whose type still has
+            # files at all.
+            remaining_names = {
+                _file_stem(f.path) for f in kept_files
+            }
+            pruned = []
+            for m in art.members:
+                if m.name in remaining_names or _member_has_file(m, kept_files):
+                    pruned.append(m)
+            art.members = pruned
+    return filtered
+
+
+def _file_stem(path: str) -> str:
+    """Best-effort component fullName from a file path (strip dir + extensions)."""
+    base = path.strip().lstrip("/").split("/")[-1]
+    # Strip known compound extensions first (e.g. .layout-meta.xml, .object-meta.xml).
+    for ext in (
+        "-meta.xml",
+    ):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+    # Strip the remaining single extension.
+    if "." in base:
+        base = base.rsplit(".", 1)[0]
+    return base
+
+
+def _member_has_file(member, files) -> bool:
+    """True if any kept file path plausibly backs this member (by fullName)."""
+    name = member.name
+    for f in files:
+        stem = _file_stem(f.path)
+        if stem == name or name.endswith(stem) or stem.endswith(name):
+            return True
+    return False
+
+
 def _normalize_status(raw: dict) -> dict:
     """Flatten checkDeployStatus output into a compact, JSON-serializable dict."""
     state = raw.get("state")

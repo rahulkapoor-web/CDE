@@ -6,7 +6,12 @@ import pytest
 
 from app.llm.base import LLMProvider, LLMResult
 from app.schemas.planning import PlanningContext
-from app.services.planner import PlanGenerationError, _extract_json, generate_plan
+from app.services.planner import (
+    PlanGenerationError,
+    _extract_json,
+    generate_plan,
+    refine_plan,
+)
 
 
 class ScriptedProvider(LLMProvider):
@@ -69,7 +74,7 @@ async def test_generate_plan_retries_then_succeeds(valid_plan_dict):
     # First response missing a Test step -> business-rule failure; second is valid.
     broken = json.loads(json.dumps(valid_plan_dict))
     broken["steps"] = [s for s in broken["steps"] if s["type"] != "Test"]
-    broken["deployment_sequence"]["sandbox_steps"] = [1]
+    broken["deployment_sequence"]["org_steps"] = [1]
     provider = ScriptedProvider([json.dumps(broken), json.dumps(valid_plan_dict)])
 
     plan, _ = await generate_plan(provider, _ctx(), max_retries=2)
@@ -86,3 +91,71 @@ async def test_generate_plan_raises_after_exhausting_retries():
         await generate_plan(provider, _ctx(), max_retries=1)
     assert exc.value.attempts == 2
     assert exc.value.last_errors
+
+
+@pytest.mark.asyncio
+async def test_refine_plan_seeds_current_plan_and_feedback(valid_plan_dict):
+    import copy
+
+    revised = copy.deepcopy(valid_plan_dict)
+    revised["summary"] = "Revised summary"
+    provider = ScriptedProvider([json.dumps(revised)])
+
+    plan, plan_dict = await refine_plan(
+        provider,
+        _ctx(),
+        current_plan=valid_plan_dict,
+        feedback="Only add the field, drop everything else.",
+        max_retries=1,
+    )
+    assert plan_dict["summary"] == "Revised summary"
+    # The single prompt must carry both the current plan and the feedback.
+    prompt = provider.calls[0]
+    assert "CURRENT PLAN JSON" in prompt
+    assert "Only add the field" in prompt
+
+
+@pytest.mark.asyncio
+async def test_refine_prompt_includes_deploy_error_guidance(valid_plan_dict):
+    import copy
+
+    revised = copy.deepcopy(valid_plan_dict)
+    provider = ScriptedProvider([json.dumps(revised)])
+
+    feedback = (
+        "The Salesforce deployment failed with the following errors:\n"
+        "- lwc/foo/foo.js: Invalid field Account.Bogus__c"
+    )
+    await refine_plan(
+        provider,
+        _ctx(),
+        current_plan=valid_plan_dict,
+        feedback=feedback,
+        max_retries=1,
+    )
+    prompt = provider.calls[0]
+    # The refine prompt must instruct the model to treat deploy errors as
+    # authoritative and never invent fields absent from the org context.
+    assert "DEPLOYMENT ERRORS" in prompt
+    assert "NEVER invent" in prompt
+    # The concrete error text must be carried through to the model.
+    assert "Account.Bogus__c" in prompt
+
+
+@pytest.mark.asyncio
+async def test_refine_plan_retries_on_invalid_then_succeeds(valid_plan_dict):
+    broken = json.loads(json.dumps(valid_plan_dict))
+    broken["steps"] = [s for s in broken["steps"] if s["type"] != "Test"]
+    broken["deployment_sequence"]["org_steps"] = [1]
+    provider = ScriptedProvider([json.dumps(broken), json.dumps(valid_plan_dict)])
+
+    plan, _ = await refine_plan(
+        provider,
+        _ctx(),
+        current_plan=valid_plan_dict,
+        feedback="tweak",
+        max_retries=2,
+    )
+    assert plan.jira_ticket == "LSC-1"
+    assert len(provider.calls) == 2
+    assert "rejected" in provider.calls[1]

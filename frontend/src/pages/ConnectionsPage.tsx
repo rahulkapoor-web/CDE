@@ -19,6 +19,7 @@ const TYPE_COLORS: Record<ConnType, string> = {
   jira: "blue",
   github: "purple",
   salesforce: "cyan",
+  checklist: "gold",
 };
 
 const SECRET_KEYS: Record<ConnType, string[]> = {
@@ -31,6 +32,8 @@ const SECRET_KEYS: Record<ConnType, string[]> = {
     "private_key",
     "access_token",
   ],
+  // A checklist stores its rubric text in config; it has no secret.
+  checklist: [],
 };
 
 export default function ConnectionsPage() {
@@ -178,6 +181,7 @@ export default function ConnectionsPage() {
                 { value: "jira", label: "JIRA" },
                 { value: "github", label: "GitHub" },
                 { value: "salesforce", label: "Salesforce" },
+                { value: "checklist", label: "Checklist (review rubric)" },
               ]}
             />
           </Form.Item>
@@ -202,6 +206,32 @@ export default function ConnectionsPage() {
                 rules={[{ required: secretRequired }]}
               >
                 <Input.Password placeholder={editing ? "(unchanged)" : ""} />
+              </Form.Item>
+            </>
+          )}
+          {connType === "checklist" && (
+            <>
+              <Form.Item
+                name="description"
+                label="Description (optional)"
+              >
+                <Input placeholder="e.g. LSC release readiness checklist" />
+              </Form.Item>
+              <Form.Item
+                name="content"
+                label="Checklist items (one per line)"
+                rules={[{ required: true }]}
+                extra="Plain lines or markdown bullets. The plan is reviewed against each item."
+              >
+                <Input.TextArea
+                  rows={10}
+                  placeholder={
+                    "- All new fields have field-level security defined\n" +
+                    "- Apex has >= 75% coverage\n" +
+                    "- No hardcoded IDs\n" +
+                    "- Layout changes preserve required fields"
+                  }
+                />
               </Form.Item>
             </>
           )}

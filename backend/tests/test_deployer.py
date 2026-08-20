@@ -16,6 +16,7 @@ from app.services.deployer import (
     build_package_xml,
     build_package_zip,
     deploy_plan,
+    filter_plan_for_deploy,
 )
 
 
@@ -92,6 +93,64 @@ def test_build_package_zip_rejects_conflicting_file_bodies(valid_plan_dict):
     plan = Plan.model_validate(data)
     with pytest.raises(ValueError, match="Conflicting content"):
         build_package_zip(plan)
+
+
+# ---- deploy-time subset selection ------------------------------------------
+
+
+def test_filter_by_step_numbers_excludes_unselected_step(valid_plan_dict):
+    plan = _plan_with_artifacts(valid_plan_dict)
+    # Keep only step 1's artifact.
+    filtered = filter_plan_for_deploy(plan, step_numbers=[1])
+    pkg = build_package_zip(filtered)
+    assert pkg.steps_included == [1]
+    assert (
+        "objects/HealthCondition/fields/Diagnosis_Code__c.field-meta.xml"
+        in pkg.file_paths
+    )
+    assert "permissionsets/PSL.permissionset-meta.xml" not in pkg.file_paths
+
+
+def test_filter_does_not_mutate_input(valid_plan_dict):
+    plan = _plan_with_artifacts(valid_plan_dict)
+    filter_plan_for_deploy(plan, step_numbers=[1])
+    # Original plan still has both artifacts.
+    assert plan.steps[0].metadata_artifact is not None
+    assert plan.steps[1].metadata_artifact is not None
+
+
+def test_filter_by_artifact_paths_keeps_only_selected_file(valid_plan_dict):
+    plan = _plan_with_artifacts(valid_plan_dict)
+    keep = "permissionsets/PSL.permissionset-meta.xml"
+    filtered = filter_plan_for_deploy(plan, artifact_paths=[keep])
+    pkg = build_package_zip(filtered)
+    assert pkg.file_paths == [keep]
+    # package.xml should not list CustomField (its file was dropped).
+    xml = build_package_xml(filtered)
+    assert "<name>PermissionSet</name>" in xml
+    assert "CustomField" not in xml
+
+
+def test_filter_prunes_members_without_backing_file(valid_plan_dict):
+    plan = _plan_with_artifacts(valid_plan_dict)
+    filtered = filter_plan_for_deploy(plan, step_numbers=[2])
+    xml = build_package_xml(filtered)
+    assert "<members>PSL</members>" in xml
+    assert "Diagnosis_Code__c" not in xml
+
+
+def test_filter_empty_selection_yields_no_metadata(valid_plan_dict):
+    plan = _plan_with_artifacts(valid_plan_dict)
+    filtered = filter_plan_for_deploy(plan, step_numbers=[])
+    with pytest.raises(NoDeployableMetadataError):
+        build_package_zip(filtered)
+
+
+def test_filter_none_is_noop(valid_plan_dict):
+    plan = _plan_with_artifacts(valid_plan_dict)
+    filtered = filter_plan_for_deploy(plan)  # both None
+    pkg = build_package_zip(filtered)
+    assert pkg.steps_included == [1, 2]
 
 
 def test_build_package_zip_rejects_user_supplied_package_xml(valid_plan_dict):

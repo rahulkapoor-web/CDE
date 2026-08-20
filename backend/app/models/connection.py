@@ -16,6 +16,11 @@ from app.core.database import Base
 JIRA = "jira"
 GITHUB = "github"
 SALESFORCE = "salesforce"
+# A checklist is a reusable, project-wide review rubric. It has no live endpoint
+# or secret; its config holds the checklist text. Modeled as a connection so it
+# reuses the same CRUD/ownership and appears in the same selector UX as the other
+# sources during plan generation.
+CHECKLIST = "checklist"
 
 
 class Connection(Base):
