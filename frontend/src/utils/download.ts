@@ -1,3 +1,4 @@
+import { githubSteps, orgSteps } from "../types";
 import type { PlanJson } from "../types";
 
 export function downloadFile(filename: string, content: string, mime: string) {
@@ -31,6 +32,13 @@ export function planToMarkdown(plan: PlanJson): string {
     lines.push("");
   }
 
+  if (plan.assumed_prerequisites?.length) {
+    lines.push("## Assumed prerequisites");
+    lines.push("_Assumed already present; not created or deployed by this plan._");
+    plan.assumed_prerequisites.forEach((p) => lines.push(`- ${p}`));
+    lines.push("");
+  }
+
   if (plan.lsc_guide_references.length) {
     lines.push("## LSC Guide References");
     plan.lsc_guide_references.forEach((r) =>
@@ -61,9 +69,8 @@ export function planToMarkdown(plan: PlanJson): string {
   lines.push("");
 
   lines.push("## Deployment Sequence");
-  lines.push(`- **Sandbox:** ${plan.deployment_sequence.sandbox_steps.join(", ") || "—"}`);
-  lines.push(`- **Production:** ${plan.deployment_sequence.production_steps.join(", ") || "—"}`);
-  lines.push(`- **GitHub Actions:** ${plan.deployment_sequence.github_actions_steps.join(", ") || "—"}`);
+  lines.push(`- **Connected org:** ${orgSteps(plan.deployment_sequence).join(", ") || "—"}`);
+  lines.push(`- **GitHub Actions:** ${githubSteps(plan.deployment_sequence).join(", ") || "—"}`);
   lines.push("");
 
   if (plan.post_deployment.length) {

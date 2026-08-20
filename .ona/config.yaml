@@ -1,0 +1,79 @@
+services:
+  database:
+    name: Database
+    description: PostgreSQL for SFDC Dev Agent (data persisted in a named volume)
+    commands:
+      start: |
+        # Persist data across restarts in a named volume so users/plans survive.
+        # Reuse the existing container if present; only create it when missing.
+        # IMPORTANT: never `docker rm` here — that would wipe the database.
+        if [ -z "$(docker ps -aq -f name=^ona-pg$)" ]; then
+          docker run -d --name ona-pg \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=ona_planner \
+            -v ona-pg-data:/var/lib/postgresql/data \
+            -p 5432:5432 postgres:16
+        else
+          docker start ona-pg
+        fi
+        docker logs -f ona-pg
+      ready: docker exec ona-pg pg_isready -U postgres
+    triggeredBy:
+      - postDevcontainerStart
+      - postEnvironmentStart
+
+  backend:
+    name: Backend API
+    description: FastAPI backend
+    commands:
+      start: |
+        cd backend
+        pip install -q -r requirements.txt
+        sleep 6
+        DATABASE_URL_SYNC=postgresql+psycopg2://postgres:postgres@localhost:5432/ona_planner \
+          alembic upgrade head 2>/dev/null || true
+        DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/ona_planner \
+          python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+      ready: curl -sf http://localhost:8000/api/planning/schema >/dev/null
+    triggeredBy:
+      - postDevcontainerStart
+      - postEnvironmentStart
+
+  frontend:
+    name: Frontend Dev Server
+    description: React (Vite) frontend dev server
+    commands:
+      start: |
+        cd frontend
+        npm install
+        npm run dev
+      ready: curl -sf http://localhost:3000/ >/dev/null
+    triggeredBy:
+      - postDevcontainerStart
+      - postEnvironmentStart
+
+tasks:
+  migrate:
+    name: Run DB Migrations
+    description: Run Alembic database migrations
+    command: |
+      cd backend && DATABASE_URL_SYNC=postgresql+psycopg2://postgres:postgres@localhost:5432/ona_planner alembic upgrade head
+    triggeredBy:
+      - manual
+
+  test:
+    name: Backend Tests
+    description: Run backend pytest suite
+    command: |
+      cd backend && DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/ona_planner python -m pytest -q
+    triggeredBy:
+      - manual
+
+  build_frontend:
+    name: Build Frontend
+    description: Build frontend for production
+    command: |
+      cd frontend && npm run build
+    triggeredBy:
+      - manual

@@ -27,6 +27,9 @@ def jira_from_connection(conn: Connection) -> JiraConnector:
         base_url=conn.config.get("base_url", ""),
         email=conn.config.get("email"),
         api_token=secrets.get("api_token", ""),
+        # Optional override: field id (customfield_XXXXX) or human name for the
+        # acceptance-criteria field, when auto-detection isn't right.
+        acceptance_field=conn.config.get("acceptance_field"),
     )
 
 

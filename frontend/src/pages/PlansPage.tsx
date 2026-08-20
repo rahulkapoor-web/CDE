@@ -4,6 +4,24 @@ import { useNavigate } from "react-router-dom";
 import { planningApi } from "../services/api";
 import type { PlanSummary } from "../types";
 
+function statusColor(s: string): string {
+  switch (s) {
+    case "generating":
+      return "processing";
+    case "generation_failed":
+    case "deploy_failed":
+      return "red";
+    case "deploying":
+      return "blue";
+    case "deployed":
+      return "green";
+    case "approved":
+      return "cyan";
+    default:
+      return "default";
+  }
+}
+
 export default function PlansPage() {
   const [plans, setPlans] = useState<PlanSummary[]>([]);
   const navigate = useNavigate();
@@ -25,7 +43,7 @@ export default function PlansPage() {
             title: "Status",
             dataIndex: "status",
             width: 120,
-            render: (s: string) => <Tag color="green">{s}</Tag>,
+            render: (s: string) => <Tag color={statusColor(s)}>{s}</Tag>,
           },
           {
             title: "Created",

@@ -10,7 +10,7 @@ export interface AuthResponse {
   user: User;
 }
 
-export type ConnType = "jira" | "github" | "salesforce";
+export type ConnType = "jira" | "github" | "salesforce" | "checklist";
 
 export interface Connection {
   id: number;
@@ -21,6 +21,12 @@ export interface Connection {
   created_at: string;
 }
 
+export interface JiraImage {
+  filename: string;
+  media_type: string;
+  data: string; // base64
+}
+
 export interface PlanningContext {
   jira_ticket_id: string;
   jira_summary: string;
@@ -28,7 +34,10 @@ export interface PlanningContext {
   jira_acceptance_criteria: string;
   jira_type: string;
   jira_priority: string;
+  jira_images: JiraImage[];
   sf_org_edition: string;
+  // Target org's highest supported API version (e.g. "62.0").
+  sf_api_version: string;
   lsc_modules: string[];
   installed_packages: string[];
   metadata_objects: string[];
@@ -36,9 +45,18 @@ export interface PlanningContext {
   metadata_flows: string[];
   metadata_apex_classes: string[];
   metadata_permission_sets: string[];
+  metadata_profiles: string[];
+  // Enablement mechanism chosen up front: "" | "profile" | "permission_set".
+  enablement_target: string;
+  enablement_profiles: string[];
+  enablement_permission_sets: string[];
   github_branch: string;
   github_recent_commits: string[];
   github_open_prs: string[];
+  // Existing layout XML retrieved from the org, keyed by layout fullName. Not a
+  // form field; carried through generate so the backend can merge layout_edits
+  // into the real layout (preserving required items like Name).
+  existing_layouts: Record<string, string>;
 }
 
 export interface LscGuideReference {
@@ -109,6 +127,7 @@ export interface PlanJson {
   estimated_effort: string;
   lsc_guide_references: LscGuideReference[];
   prerequisites: string[];
+  assumed_prerequisites: string[];
   steps: PlanStep[];
   testing_requirements: {
     unit_tests: string;
@@ -117,9 +136,12 @@ export interface PlanJson {
     minimum_code_coverage: number;
   };
   deployment_sequence: {
-    sandbox_steps: number[];
-    production_steps: number[];
-    github_actions_steps: number[];
+    org_steps?: number[];
+    github_actions_steps?: number[];
+    // Legacy shape (pre connected-org model); still present on older stored
+    // plans. Read via orgSteps() so the UI tolerates either shape.
+    sandbox_steps?: number[];
+    production_steps?: number[];
   };
   post_deployment: string[];
   open_questions: string[];
@@ -144,6 +166,36 @@ export interface Plan {
   deploy_started_at?: string | null;
   deploy_finished_at?: string | null;
   deploy_result?: DeployResult | null;
+  generation_error?: string | null;
+}
+
+export interface GithubCommitResult {
+  branch: string;
+  commit_sha: string;
+  commit_url: string;
+  branch_url: string;
+  files: string[];
+  created_branch: boolean;
+  metadata_format: string;
+}
+
+export interface JiraCommentResult {
+  ticket_id: string;
+  comment_id: string | null;
+  url: string;
+}
+
+export interface ChecklistItemResult {
+  item: string;
+  status: "pass" | "fail" | "partial" | "not_applicable";
+  finding: string;
+}
+
+export interface ChecklistReviewResult {
+  checklist_name: string;
+  overall: "pass" | "fail" | "partial";
+  summary: string;
+  results: ChecklistItemResult[];
 }
 
 export interface PlanSummary {
@@ -152,4 +204,22 @@ export interface PlanSummary {
   summary: string | null;
   status: string;
   created_at: string;
+}
+
+/**
+ * Steps applied to the connected org, tolerant of both the current shape
+ * (`org_steps`) and the legacy shape (`sandbox_steps` + `production_steps`).
+ * Older stored plans predate the connected-org model, so reading the raw field
+ * directly can be undefined and crash the UI on `.join()`.
+ */
+export function orgSteps(ds: PlanJson["deployment_sequence"]): number[] {
+  if (!ds) return [];
+  if (Array.isArray(ds.org_steps)) return ds.org_steps;
+  const legacy = [...(ds.sandbox_steps ?? []), ...(ds.production_steps ?? [])];
+  return Array.from(new Set(legacy));
+}
+
+/** GitHub/CI steps, tolerant of a missing field on legacy plans. */
+export function githubSteps(ds: PlanJson["deployment_sequence"]): number[] {
+  return ds?.github_actions_steps ?? [];
 }

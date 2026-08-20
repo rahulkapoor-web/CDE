@@ -16,6 +16,7 @@ from app.services.deployer import (
     build_package_xml,
     build_package_zip,
     deploy_plan,
+    filter_plan_for_deploy,
 )
 
 
@@ -72,6 +73,138 @@ def test_package_xml_lists_types_and_members(valid_plan_dict):
     assert "<version>60.0</version>" in xml
 
 
+def _plan_with_apex(base: dict, meta_version: str) -> Plan:
+    """Plan whose first step ships an Apex class whose meta declares a version."""
+    data = copy.deepcopy(base)
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {"path": "classes/Foo.cls", "body": "public class Foo {}"},
+            {
+                "path": "classes/Foo.cls-meta.xml",
+                "body": (
+                    '<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<ApexClass xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+                    f"    <apiVersion>{meta_version}</apiVersion>\n"
+                    "    <status>Active</status>\n"
+                    "</ApexClass>\n"
+                ),
+            },
+        ],
+        "members": [{"type": "ApexClass", "name": "Foo"}],
+        "api_version": meta_version,
+    }
+    return Plan.model_validate(data)
+
+
+def _read_zip(pkg) -> dict[str, str]:
+    zf = zipfile.ZipFile(io.BytesIO(pkg.zip_bytes))
+    return {n: zf.read(n).decode() for n in zf.namelist()}
+
+
+def test_org_api_version_overrides_meta_and_package(valid_plan_dict):
+    """The org's API version rewrites the meta file's apiVersion and package.xml
+    version, so a stale LLM-authored version never reaches the org."""
+    plan = _plan_with_apex(valid_plan_dict, meta_version="55.0")
+    pkg = build_package_zip(plan, api_version="62.0")
+
+    files = _read_zip(pkg)
+    assert "<version>62.0</version>" in files["package.xml"]
+    assert "<version>55.0</version>" not in files["package.xml"]
+    meta = files["classes/Foo.cls-meta.xml"]
+    assert "<apiVersion>62.0</apiVersion>" in meta
+    assert "55.0" not in meta
+    # The Apex body itself is untouched.
+    assert files["classes/Foo.cls"] == "public class Foo {}"
+
+
+def test_default_api_version_falls_back_to_artifact(valid_plan_dict):
+    """When the caller passes the built-in default (org version unknown), the
+    artifact-declared version is used rather than clobbering it."""
+    plan = _plan_with_apex(valid_plan_dict, meta_version="58.0")
+    xml = build_package_xml(plan)  # default DEFAULT_API_VERSION
+    assert "<version>58.0</version>" in xml
+
+
+def _object_file(members_xml: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        f"{members_xml}\n"
+        "</CustomObject>\n"
+    )
+
+
+def test_same_object_files_from_different_steps_are_merged(valid_plan_dict):
+    """A field and a validation rule created on the same object in separate steps
+    must merge into one CustomObject file with BOTH members, not error out."""
+    data = copy.deepcopy(valid_plan_dict)
+    field_xml = _object_file(
+        "  <fields>\n    <fullName>Resolution_Summary__c</fullName>\n"
+        "    <type>LongTextArea</type>\n  </fields>"
+    )
+    rule_xml = _object_file(
+        "  <validationRules>\n    <fullName>Require_Resolution</fullName>\n"
+        "    <active>true</active>\n  </validationRules>"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "objects/Case.object", "body": field_xml}],
+        "members": [{"type": "CustomField", "name": "Case.Resolution_Summary__c"}],
+    }
+    data["steps"][1]["metadata_artifact"] = {
+        "files": [{"path": "objects/Case.object", "body": rule_xml}],
+        "members": [
+            {"type": "ValidationRule", "name": "Case.Require_Resolution"}
+        ],
+    }
+    plan = Plan.model_validate(data)
+
+    pkg = build_package_zip(plan)
+    merged = _read_zip(pkg)["objects/Case.object"]
+
+    # Both members survive the merge into a single object file.
+    assert "Resolution_Summary__c" in merged
+    assert "Require_Resolution" in merged
+    assert merged.count("<CustomObject") == 1
+
+
+def test_duplicate_object_member_is_deduped(valid_plan_dict):
+    """Identical members emitted by two steps merge to a single entry."""
+    data = copy.deepcopy(valid_plan_dict)
+    same = _object_file(
+        "  <fields>\n    <fullName>Foo__c</fullName>\n"
+        "    <type>Text</type>\n  </fields>"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "objects/Case.object", "body": same}],
+        "members": [{"type": "CustomField", "name": "Case.Foo__c"}],
+    }
+    data["steps"][1]["metadata_artifact"] = {
+        "files": [{"path": "objects/Case.object", "body": same}],
+        "members": [{"type": "CustomField", "name": "Case.Foo__c"}],
+    }
+    plan = Plan.model_validate(data)
+
+    merged = _read_zip(build_package_zip(plan))["objects/Case.object"]
+    assert merged.count("<fullName>Foo__c</fullName>") == 1
+
+
+def test_conflicting_non_mergeable_file_still_raises(valid_plan_dict):
+    """Two steps emitting different bodies for a non-aggregate file (e.g. Apex)
+    is a real conflict and must still be rejected."""
+    data = copy.deepcopy(valid_plan_dict)
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "classes/Foo.cls", "body": "public class Foo {}"}],
+        "members": [{"type": "ApexClass", "name": "Foo"}],
+    }
+    data["steps"][1]["metadata_artifact"] = {
+        "files": [{"path": "classes/Foo.cls", "body": "public class Foo { Integer x; }"}],
+        "members": [{"type": "ApexClass", "name": "Foo"}],
+    }
+    plan = Plan.model_validate(data)
+    with pytest.raises(ValueError, match="Conflicting content"):
+        build_package_zip(plan)
+
+
 def test_build_package_zip_raises_when_no_metadata(valid_plan_dict):
     # The shared plan has no metadata_artifact on any step.
     plan = Plan.model_validate(valid_plan_dict)
@@ -80,10 +213,13 @@ def test_build_package_zip_raises_when_no_metadata(valid_plan_dict):
 
 
 def test_build_package_zip_rejects_conflicting_file_bodies(valid_plan_dict):
+    # A non-aggregate file (permission set) emitted twice with different bodies
+    # is a genuine conflict. (Aggregate .object files merge instead — see
+    # test_same_object_files_from_different_steps_are_merged.)
     data = copy.deepcopy(valid_plan_dict)
     art = {
-        "files": [{"path": "objects/X.object", "body": "<A/>"}],
-        "members": [{"type": "CustomObject", "name": "X"}],
+        "files": [{"path": "permissionsets/X.permissionset", "body": "<A/>"}],
+        "members": [{"type": "PermissionSet", "name": "X"}],
     }
     data["steps"][0]["metadata_artifact"] = copy.deepcopy(art)
     conflicting = copy.deepcopy(art)
@@ -92,6 +228,64 @@ def test_build_package_zip_rejects_conflicting_file_bodies(valid_plan_dict):
     plan = Plan.model_validate(data)
     with pytest.raises(ValueError, match="Conflicting content"):
         build_package_zip(plan)
+
+
+# ---- deploy-time subset selection ------------------------------------------
+
+
+def test_filter_by_step_numbers_excludes_unselected_step(valid_plan_dict):
+    plan = _plan_with_artifacts(valid_plan_dict)
+    # Keep only step 1's artifact.
+    filtered = filter_plan_for_deploy(plan, step_numbers=[1])
+    pkg = build_package_zip(filtered)
+    assert pkg.steps_included == [1]
+    assert (
+        "objects/HealthCondition/fields/Diagnosis_Code__c.field-meta.xml"
+        in pkg.file_paths
+    )
+    assert "permissionsets/PSL.permissionset-meta.xml" not in pkg.file_paths
+
+
+def test_filter_does_not_mutate_input(valid_plan_dict):
+    plan = _plan_with_artifacts(valid_plan_dict)
+    filter_plan_for_deploy(plan, step_numbers=[1])
+    # Original plan still has both artifacts.
+    assert plan.steps[0].metadata_artifact is not None
+    assert plan.steps[1].metadata_artifact is not None
+
+
+def test_filter_by_artifact_paths_keeps_only_selected_file(valid_plan_dict):
+    plan = _plan_with_artifacts(valid_plan_dict)
+    keep = "permissionsets/PSL.permissionset-meta.xml"
+    filtered = filter_plan_for_deploy(plan, artifact_paths=[keep])
+    pkg = build_package_zip(filtered)
+    assert pkg.file_paths == [keep]
+    # package.xml should not list CustomField (its file was dropped).
+    xml = build_package_xml(filtered)
+    assert "<name>PermissionSet</name>" in xml
+    assert "CustomField" not in xml
+
+
+def test_filter_prunes_members_without_backing_file(valid_plan_dict):
+    plan = _plan_with_artifacts(valid_plan_dict)
+    filtered = filter_plan_for_deploy(plan, step_numbers=[2])
+    xml = build_package_xml(filtered)
+    assert "<members>PSL</members>" in xml
+    assert "Diagnosis_Code__c" not in xml
+
+
+def test_filter_empty_selection_yields_no_metadata(valid_plan_dict):
+    plan = _plan_with_artifacts(valid_plan_dict)
+    filtered = filter_plan_for_deploy(plan, step_numbers=[])
+    with pytest.raises(NoDeployableMetadataError):
+        build_package_zip(filtered)
+
+
+def test_filter_none_is_noop(valid_plan_dict):
+    plan = _plan_with_artifacts(valid_plan_dict)
+    filtered = filter_plan_for_deploy(plan)  # both None
+    pkg = build_package_zip(filtered)
+    assert pkg.steps_included == [1, 2]
 
 
 def test_build_package_zip_rejects_user_supplied_package_xml(valid_plan_dict):

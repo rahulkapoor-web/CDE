@@ -14,6 +14,23 @@ def test_system_prompt_loads():
     assert "OUTPUT FORMAT" in text
 
 
+def test_system_prompt_has_correct_flexipage_schema():
+    """The prompt must teach the valid FlexiPage element hierarchy so the model
+    stops emitting invalid elements like `componentInstances` (plural), which
+    fail with "Property 'componentInstances' not valid in version N"."""
+    text = load_system_prompt()
+    # The valid singular element is documented...
+    assert "componentInstance" in text
+    assert "flexiPageRegions" in text
+    assert "itemInstances" in text
+    # ...and the invalid plural is explicitly called out as wrong.
+    assert "NO `componentInstances`" in text or "no `componentInstances`" in text
+    # The valid record-page template must be documented and invented slds*
+    # template names called out, so "Template ... doesn't exist" stops recurring.
+    assert "flexipage:recordHomeTemplateDesktop" in text
+    assert "slds" in text
+
+
 def test_user_prompt_injects_context():
     ctx = PlanningContext(
         jira_ticket_id="LSC-42",
@@ -32,6 +49,35 @@ def test_user_prompt_injects_context():
 def test_user_prompt_notes_missing_guide_context():
     prompt = build_user_prompt(PlanningContext(jira_ticket_id="X"))
     assert "No LSC guide excerpts" in prompt
+
+
+def test_user_prompt_enablement_profile():
+    ctx = PlanningContext(
+        jira_ticket_id="X",
+        enablement_target="profile",
+        enablement_profiles=["System Administrator", "Sales User"],
+    )
+    prompt = build_user_prompt(ctx)
+    assert "PROFILE level" in prompt
+    assert "System Administrator, Sales User" in prompt
+    assert "type Profile" in prompt
+
+
+def test_user_prompt_enablement_permission_set():
+    ctx = PlanningContext(
+        jira_ticket_id="X",
+        enablement_target="permission_set",
+        enablement_permission_sets=["PS_Sales"],
+    )
+    prompt = build_user_prompt(ctx)
+    assert "PERMISSION SETS" in prompt
+    assert "PS_Sales" in prompt
+    assert "type PermissionSet" in prompt
+
+
+def test_user_prompt_no_enablement_when_unset():
+    prompt = build_user_prompt(PlanningContext(jira_ticket_id="X"))
+    assert "ACCESS ENABLEMENT" not in prompt
 
 
 def test_user_prompt_includes_guide_context_when_present():

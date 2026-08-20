@@ -15,16 +15,34 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import time
 import zipfile
 from dataclasses import dataclass, field
+from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
 from app.schemas.plan import Plan
 
 logger = logging.getLogger(__name__)
 
+_MDAPI_NS = "http://soap.sforce.com/2006/04/metadata"
+
+# MDAPI metadata types whose single file aggregates many child members (e.g. a
+# CustomObject file holds all fields, validationRules, listViews...). When two
+# steps each emit the same such file with different children, they must be MERGED
+# into one file rather than rejected as conflicting.
+_MERGEABLE_SUFFIXES = (".object", ".object-meta.xml")
+
 DEFAULT_API_VERSION = "60.0"
+
+# Matches the version element inside Apex/LWC/Aura meta files, e.g.
+# <apiVersion>60.0</apiVersion>. Case-insensitive on the tag so both the
+# metadata <apiVersion> and any stray <version> in a meta file are normalized.
+_API_VERSION_RE = re.compile(
+    r"(<(?P<tag>apiVersion|version)>)\s*[\d.]+\s*(</(?P=tag)>)",
+    re.IGNORECASE,
+)
 
 # Terminal deploy states reported by the Metadata API.
 _TERMINAL_STATES = {"Succeeded", "Failed", "Canceled", "SucceededPartial"}
@@ -60,16 +78,99 @@ def _collect_members(plan: Plan) -> dict[str, list[str]]:
     return by_type
 
 
+def _is_mergeable(path: str) -> bool:
+    """True for MDAPI files that aggregate child members (e.g. CustomObject)."""
+    p = path.lower()
+    return p.endswith(_MERGEABLE_SUFFIXES)
+
+
+def _child_key(el: ET.Element) -> tuple[str, str]:
+    """Identity of a CustomObject child for merge dedup.
+
+    Uses the element tag plus its <fullName> (the member name Salesforce keys on,
+    e.g. a field's API name). Children without a fullName fall back to their
+    serialized text so identical singletons don't duplicate.
+    """
+    tag = el.tag.split("}")[-1]
+    full = el.find(f"{{{_MDAPI_NS}}}fullName")
+    if full is None:
+        full = el.find("fullName")
+    name = (full.text or "").strip() if full is not None else ""
+    if not name:
+        name = ET.tostring(el, encoding="unicode")
+    return (tag, name)
+
+
+def _merge_object_xml(existing: str, incoming: str) -> str:
+    """Merge two CustomObject XML documents into one.
+
+    A CustomObject `.object` file must contain ALL of an object's members (every
+    field, validationRule, etc.). When separate plan steps each create a
+    different member on the same object, they emit the same `objects/X.object`
+    path with only their own child — deploying either alone, or rejecting them as
+    "conflicting", is wrong. This unions their child elements (dedup by
+    tag+fullName) so the object deploys with every member present.
+
+    Falls back to raising on unparseable XML so genuine corruption still surfaces.
+    """
+    ET.register_namespace("", _MDAPI_NS)
+    root_a = ET.fromstring(existing)
+    root_b = ET.fromstring(incoming)
+
+    seen = {_child_key(c) for c in list(root_a)}
+    for child in list(root_b):
+        key = _child_key(child)
+        if key not in seen:
+            root_a.append(child)
+            seen.add(key)
+
+    xml = ET.tostring(root_a, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
+def _is_meta_file(path: str) -> bool:
+    """True for Apex/LWC/Aura meta files that carry an <apiVersion> element."""
+    p = path.lower()
+    return p.endswith("-meta.xml")
+
+
+def _normalize_api_version_in_body(body: str, api_version: str) -> str:
+    """Rewrite any <apiVersion>/<version> element in a meta file to the org's.
+
+    LLM-authored Apex ``.cls-meta.xml`` and LWC ``.js-meta.xml`` files hardcode
+    an apiVersion (often a stale default) that may not match the target org,
+    which causes deploy failures and drives the fix-with-AI error loop. Forcing
+    every meta file to the org's real API version at build time makes deploys
+    deterministic regardless of what the model emitted.
+    """
+    return _API_VERSION_RE.sub(
+        lambda m: f"{m.group(1)}{api_version}{m.group(3)}", body
+    )
+
+
+def _resolve_api_version(plan: Plan, api_version: str) -> str:
+    """Pick the API version for the package.
+
+    The caller-provided ``api_version`` (the org's real version, when known) is
+    authoritative. Only when it is the built-in default do we fall back to the
+    first artifact-specified version, so an explicitly passed org version always
+    wins over whatever the LLM wrote.
+    """
+    if api_version and api_version != DEFAULT_API_VERSION:
+        return api_version
+    for step in plan.steps:
+        if step.metadata_artifact and step.metadata_artifact.api_version:
+            return step.metadata_artifact.api_version
+    return api_version
+
+
 def build_package_xml(plan: Plan, api_version: str = DEFAULT_API_VERSION) -> str:
     """Render a package.xml from the merged members of all steps.
 
-    api_version resolution: the first step artifact that specifies an
-    ``api_version`` wins; otherwise the provided default is used.
+    ``api_version`` is the org's real API version when known; it wins over any
+    artifact-specified version so the package always targets the org's version.
     """
-    for step in plan.steps:
-        if step.metadata_artifact and step.metadata_artifact.api_version:
-            api_version = step.metadata_artifact.api_version
-            break
+    api_version = _resolve_api_version(plan, api_version)
 
     by_type = _collect_members(plan)
     lines = ['<?xml version="1.0" encoding="UTF-8"?>']
@@ -93,6 +194,7 @@ def build_package_zip(
     Raises NoDeployableMetadataError if no step carries a metadata_artifact.
     Raises ValueError on duplicate or empty file paths.
     """
+    resolved_version = _resolve_api_version(plan, api_version)
     file_map: dict[str, str] = {}
     steps_included: list[int] = []
 
@@ -111,11 +213,29 @@ def build_package_zip(
                 raise ValueError(
                     "Steps must not provide package.xml; it is generated."
                 )
-            if path in file_map and file_map[path] != f.body:
+            body = f.body
+            # Force Apex/LWC meta files to the org's API version so a stale or
+            # inconsistent LLM-authored apiVersion never fails the deploy.
+            if _is_meta_file(path):
+                body = _normalize_api_version_in_body(body, resolved_version)
+            if path in file_map and file_map[path] != body:
+                # Aggregate metadata (e.g. a CustomObject holding both a new
+                # field and a new validation rule from different steps) must be
+                # merged into one file, not rejected — the object file must carry
+                # every member or the deploy drops one.
+                if _is_mergeable(path):
+                    try:
+                        file_map[path] = _merge_object_xml(file_map[path], body)
+                        continue
+                    except ET.ParseError as exc:
+                        raise ValueError(
+                            f"Could not merge metadata file '{path}' across "
+                            f"steps: {exc}"
+                        )
                 raise ValueError(
                     f"Conflicting content for metadata file '{path}' across steps."
                 )
-            file_map[path] = f.body
+            file_map[path] = body
 
     if not file_map:
         raise NoDeployableMetadataError(
@@ -137,6 +257,84 @@ def build_package_zip(
         file_paths=sorted(file_map.keys()),
         steps_included=sorted(steps_included),
     )
+
+
+def filter_plan_for_deploy(
+    plan: Plan,
+    step_numbers: list[int] | None = None,
+    artifact_paths: list[str] | None = None,
+) -> Plan:
+    """Return a deep copy of ``plan`` narrowed to a user-selected subset.
+
+    Selection is applied to each step's ``metadata_artifact``:
+
+    * ``step_numbers`` (when not None): steps whose number is absent have their
+      artifact removed entirely, so they contribute no files/members.
+    * ``artifact_paths`` (when not None): within the remaining steps, only files
+      whose path is in the set are kept. Package members are then pruned to the
+      metadata types that still have at least one backing file in that step, so
+      package.xml never lists a type with no deployable file.
+
+    Passing ``None`` for a dimension means "no filtering on that dimension".
+    Passing an empty list means "select nothing" for that dimension. The input
+    plan is not mutated.
+    """
+    filtered = plan.model_copy(deep=True)
+    step_set = set(step_numbers) if step_numbers is not None else None
+    path_set = set(artifact_paths) if artifact_paths is not None else None
+
+    def _norm(p: str) -> str:
+        return p.strip().lstrip("/")
+
+    for step in filtered.steps:
+        art = step.metadata_artifact
+        if not art:
+            continue
+        if step_set is not None and step.step_number not in step_set:
+            step.metadata_artifact = None
+            continue
+        if path_set is not None:
+            kept_files = [f for f in art.files if _norm(f.path) in path_set]
+            art.files = kept_files
+            # Prune members to types that still have a backing file. File paths
+            # follow "<folder>/<Name>.<ext>"; the folder maps to a metadata type
+            # only loosely, so we key on whether ANY file references the member
+            # fullName, falling back to keeping members whose type still has
+            # files at all.
+            remaining_names = {
+                _file_stem(f.path) for f in kept_files
+            }
+            pruned = []
+            for m in art.members:
+                if m.name in remaining_names or _member_has_file(m, kept_files):
+                    pruned.append(m)
+            art.members = pruned
+    return filtered
+
+
+def _file_stem(path: str) -> str:
+    """Best-effort component fullName from a file path (strip dir + extensions)."""
+    base = path.strip().lstrip("/").split("/")[-1]
+    # Strip known compound extensions first (e.g. .layout-meta.xml, .object-meta.xml).
+    for ext in (
+        "-meta.xml",
+    ):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+    # Strip the remaining single extension.
+    if "." in base:
+        base = base.rsplit(".", 1)[0]
+    return base
+
+
+def _member_has_file(member, files) -> bool:
+    """True if any kept file path plausibly backs this member (by fullName)."""
+    name = member.name
+    for f in files:
+        stem = _file_stem(f.path)
+        if stem == name or name.endswith(stem) or stem.endswith(name):
+            return True
+    return False
 
 
 def _normalize_status(raw: dict) -> dict:

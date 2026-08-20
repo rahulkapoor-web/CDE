@@ -124,6 +124,15 @@ async def test_connection(
         elif conn.conn_type == "salesforce":
             # simple-salesforce is sync; run in a thread.
             info = await asyncio.to_thread(salesforce_from_connection(conn).test)
+        elif conn.conn_type == "checklist":
+            # A checklist has no live endpoint; "test" validates it has content.
+            text = (conn.config or {}).get("content", "")
+            items = [ln for ln in text.splitlines() if ln.strip()]
+            if not items:
+                return ConnectionTestResult(
+                    ok=False, detail="Checklist is empty; add at least one line."
+                )
+            info = {"items": len(items)}
         else:
             raise HTTPException(status_code=400, detail="Unknown connection type")
     except HTTPException:

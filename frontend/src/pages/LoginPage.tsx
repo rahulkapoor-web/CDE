@@ -1,7 +1,33 @@
-import { Button, Card, Form, Input, Tabs, message } from "antd";
+import { Button, Card, Form, Input, Tabs, Typography, message } from "antd";
+import {
+  CloudOutlined,
+  DeploymentUnitOutlined,
+  ThunderboltOutlined,
+} from "@ant-design/icons";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../hooks/useAuth";
+import Logo from "../components/Logo";
+
+const { Title, Paragraph } = Typography;
+
+const FEATURES = [
+  {
+    icon: <ThunderboltOutlined />,
+    title: "AI-generated plans",
+    text: "Turn a JIRA ticket into a grounded, step-by-step delivery plan.",
+  },
+  {
+    icon: <CloudOutlined />,
+    title: "Org-aware metadata",
+    text: "Apex and LWC authored against your org's real API version.",
+  },
+  {
+    icon: <DeploymentUnitOutlined />,
+    title: "One-click deploy",
+    text: "Deploy to the connected org and fix errors with AI in place.",
+  },
+];
 
 export default function LoginPage() {
   const { login, register } = useAuth();
@@ -37,16 +63,75 @@ export default function LoginPage() {
   }
 
   return (
-    <div
-      style={{
-        display: "flex",
-        justifyContent: "center",
-        alignItems: "center",
-        minHeight: "100vh",
-        background: "#f0f2f5",
-      }}
-    >
-      <Card style={{ width: 420 }} title="ONA — AI Planning Engine">
+    <div style={{ display: "flex", minHeight: "100vh" }}>
+      {/* Branded hero panel (hidden on narrow screens via flex-wrap fallback). */}
+      <div
+        style={{
+          flex: "1 1 0",
+          minWidth: 0,
+          background:
+            "linear-gradient(135deg, #00A1E0 0%, #1677ff 55%, #0b1220 100%)",
+          color: "#fff",
+          padding: "56px 48px",
+          display: "flex",
+          flexDirection: "column",
+          justifyContent: "center",
+        }}
+      >
+        <Logo size={44} />
+        <Title
+          level={2}
+          style={{ color: "#fff", marginTop: 32, marginBottom: 8, maxWidth: 460 }}
+        >
+          Ship Salesforce changes faster, with confidence.
+        </Title>
+        <Paragraph
+          style={{ color: "rgba(255,255,255,0.85)", maxWidth: 460, fontSize: 15 }}
+        >
+          SFDC Dev Agent plans, builds, and deploys Salesforce metadata from your
+          delivery tickets — grounded in your org's real configuration.
+        </Paragraph>
+        <div style={{ marginTop: 32, display: "grid", gap: 20, maxWidth: 460 }}>
+          {FEATURES.map((f) => (
+            <div key={f.title} style={{ display: "flex", gap: 14 }}>
+              <div
+                style={{
+                  fontSize: 20,
+                  background: "rgba(255,255,255,0.15)",
+                  borderRadius: 10,
+                  width: 40,
+                  height: 40,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  flexShrink: 0,
+                }}
+              >
+                {f.icon}
+              </div>
+              <div>
+                <div style={{ fontWeight: 600 }}>{f.title}</div>
+                <div style={{ color: "rgba(255,255,255,0.8)", fontSize: 13 }}>
+                  {f.text}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Auth panel. */}
+      <div
+        style={{
+          flex: "0 0 clamp(360px, 38%, 520px)",
+          display: "flex",
+          justifyContent: "center",
+          alignItems: "center",
+          background: "#f0f2f5",
+          padding: 24,
+        }}
+      >
+        <Card style={{ width: "100%", maxWidth: 400 }} title="Welcome back">
         <Tabs
           items={[
             {
@@ -88,7 +173,8 @@ export default function LoginPage() {
             },
           ]}
         />
-      </Card>
+        </Card>
+      </div>
     </div>
   );
 }

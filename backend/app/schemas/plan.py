@@ -22,11 +22,19 @@ StepType = Literal[
     "Test",
     "Deploy",
 ]
-Environment = Literal["Sandbox", "Production", "Both", "GitHub"]
+# Development happens in the connected (Dev) org; promotion to downstream orgs
+# up to production is handled by the external CI/CD pipeline, not this planner.
+# A step therefore either runs against the connected org, or is a commit that
+# feeds the CI/CD pipeline (GitHub).
+Environment = Literal["Org", "GitHub"]
 AutomationFeasibility = Literal["Full", "Partial", "Manual"]
 
 # Step types generally considered destructive / high-risk requiring rollback.
 DESTRUCTIVE_TYPES = {"DataMigration", "Deploy", "Apex", "Flow"}
+
+# Read-only step types that never mutate an org and so cannot have a meaningful
+# rollback (e.g. running a test suite).
+NON_DESTRUCTIVE_TYPES = {"Test"}
 
 
 class LscGuideReference(BaseModel):
@@ -75,6 +83,32 @@ class MetadataArtifact(BaseModel):
     api_version: str | None = None
 
 
+class LayoutFieldEdit(BaseModel):
+    """One field to place on a page layout, declaratively.
+
+    The system merges these into the REAL existing layout XML (retrieved from the
+    org) so required items are preserved and nothing is dropped — the LLM must
+    NOT hand-write full layout XML. ``behavior`` is Edit/Required/Readonly.
+    """
+
+    field: str  # API name, e.g. "Specialty__c"
+    section: str | None = None  # target section label; created if missing
+    behavior: str = "Edit"
+
+
+class LayoutEdit(BaseModel):
+    """A declarative page-layout change resolved into a deployable .layout file.
+
+    ``layout_name`` is the Layout fullName (e.g. "Account-Account Layout"). The
+    system loads the existing layout, inserts ``add_fields`` into the named
+    section (preserving all existing/required items), and emits the complete
+    layout as deployable metadata during plan generation.
+    """
+
+    layout_name: str
+    add_fields: list[LayoutFieldEdit] = Field(default_factory=list)
+
+
 class PlanStep(BaseModel):
     step_number: int
     title: str
@@ -84,6 +118,10 @@ class PlanStep(BaseModel):
     lsc_guide_reference: str | None = None
     metadata_path: str | None = None
     metadata_artifact: MetadataArtifact | None = None
+    # Declarative layout changes; resolved into metadata_artifact files by the
+    # backend using the org's existing layout XML. Preferred over hand-written
+    # Layout XML because it can never drop required items like Name.
+    layout_edits: list[LayoutEdit] = Field(default_factory=list)
     acceptance_check: str
     estimated_minutes: int
     automation_feasibility: AutomationFeasibility
@@ -100,8 +138,10 @@ class TestingRequirements(BaseModel):
 
 
 class DeploymentSequence(BaseModel):
-    sandbox_steps: list[int] = Field(default_factory=list)
-    production_steps: list[int] = Field(default_factory=list)
+    # Steps applied directly to the connected (Dev) org, in order.
+    org_steps: list[int] = Field(default_factory=list)
+    # Steps committed to GitHub to feed the CI/CD pipeline that promotes changes
+    # to downstream orgs up to production.
     github_actions_steps: list[int] = Field(default_factory=list)
 
 
@@ -115,6 +155,10 @@ class Plan(BaseModel):
     estimated_effort: str
     lsc_guide_references: list[LscGuideReference] = Field(default_factory=list)
     prerequisites: list[str] = Field(default_factory=list)
+    # Read-only context: platform state (perms, licenses, existing objects) the
+    # plan ASSUMES is already present. These are NOT steps and are never created
+    # or deployed — they document the environment the plan is written against.
+    assumed_prerequisites: list[str] = Field(default_factory=list)
     steps: list[PlanStep]
     testing_requirements: TestingRequirements
     deployment_sequence: DeploymentSequence
@@ -156,26 +200,20 @@ def validate_business_rules(plan: Plan) -> list[str]:
                     "earlier (possible cycle)."
                 )
 
-    # High-risk / destructive steps require a non-empty rollback.
+    # Destructive steps require a non-empty rollback. Read-only step types
+    # (e.g. Test) never mutate the org, so they are exempt.
     for s in plan.steps:
-        risky = s.type in DESTRUCTIVE_TYPES or s.environment in ("Production", "Both")
-        if risky and not (s.rollback and s.rollback.strip()):
+        if s.type in NON_DESTRUCTIVE_TYPES:
+            continue
+        if s.type in DESTRUCTIVE_TYPES and not (s.rollback and s.rollback.strip()):
             errors.append(
                 f"Step {s.step_number} ({s.type}) is high-risk and requires a "
                 "non-empty rollback."
             )
 
-    # Every production step must have a corresponding sandbox step.
-    prod = set(plan.deployment_sequence.production_steps)
-    sandbox = set(plan.deployment_sequence.sandbox_steps)
-    if prod and not sandbox:
-        errors.append(
-            "Production steps present but no sandbox steps in deployment_sequence."
-        )
     # Deployment sequence must reference real steps.
     for label, seq in (
-        ("sandbox_steps", plan.deployment_sequence.sandbox_steps),
-        ("production_steps", plan.deployment_sequence.production_steps),
+        ("org_steps", plan.deployment_sequence.org_steps),
         ("github_actions_steps", plan.deployment_sequence.github_actions_steps),
     ):
         for n in seq:
