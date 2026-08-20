@@ -125,6 +125,86 @@ def test_default_api_version_falls_back_to_artifact(valid_plan_dict):
     assert "<version>58.0</version>" in xml
 
 
+def _object_file(members_xml: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        f"{members_xml}\n"
+        "</CustomObject>\n"
+    )
+
+
+def test_same_object_files_from_different_steps_are_merged(valid_plan_dict):
+    """A field and a validation rule created on the same object in separate steps
+    must merge into one CustomObject file with BOTH members, not error out."""
+    data = copy.deepcopy(valid_plan_dict)
+    field_xml = _object_file(
+        "  <fields>\n    <fullName>Resolution_Summary__c</fullName>\n"
+        "    <type>LongTextArea</type>\n  </fields>"
+    )
+    rule_xml = _object_file(
+        "  <validationRules>\n    <fullName>Require_Resolution</fullName>\n"
+        "    <active>true</active>\n  </validationRules>"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "objects/Case.object", "body": field_xml}],
+        "members": [{"type": "CustomField", "name": "Case.Resolution_Summary__c"}],
+    }
+    data["steps"][1]["metadata_artifact"] = {
+        "files": [{"path": "objects/Case.object", "body": rule_xml}],
+        "members": [
+            {"type": "ValidationRule", "name": "Case.Require_Resolution"}
+        ],
+    }
+    plan = Plan.model_validate(data)
+
+    pkg = build_package_zip(plan)
+    merged = _read_zip(pkg)["objects/Case.object"]
+
+    # Both members survive the merge into a single object file.
+    assert "Resolution_Summary__c" in merged
+    assert "Require_Resolution" in merged
+    assert merged.count("<CustomObject") == 1
+
+
+def test_duplicate_object_member_is_deduped(valid_plan_dict):
+    """Identical members emitted by two steps merge to a single entry."""
+    data = copy.deepcopy(valid_plan_dict)
+    same = _object_file(
+        "  <fields>\n    <fullName>Foo__c</fullName>\n"
+        "    <type>Text</type>\n  </fields>"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "objects/Case.object", "body": same}],
+        "members": [{"type": "CustomField", "name": "Case.Foo__c"}],
+    }
+    data["steps"][1]["metadata_artifact"] = {
+        "files": [{"path": "objects/Case.object", "body": same}],
+        "members": [{"type": "CustomField", "name": "Case.Foo__c"}],
+    }
+    plan = Plan.model_validate(data)
+
+    merged = _read_zip(build_package_zip(plan))["objects/Case.object"]
+    assert merged.count("<fullName>Foo__c</fullName>") == 1
+
+
+def test_conflicting_non_mergeable_file_still_raises(valid_plan_dict):
+    """Two steps emitting different bodies for a non-aggregate file (e.g. Apex)
+    is a real conflict and must still be rejected."""
+    data = copy.deepcopy(valid_plan_dict)
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "classes/Foo.cls", "body": "public class Foo {}"}],
+        "members": [{"type": "ApexClass", "name": "Foo"}],
+    }
+    data["steps"][1]["metadata_artifact"] = {
+        "files": [{"path": "classes/Foo.cls", "body": "public class Foo { Integer x; }"}],
+        "members": [{"type": "ApexClass", "name": "Foo"}],
+    }
+    plan = Plan.model_validate(data)
+    with pytest.raises(ValueError, match="Conflicting content"):
+        build_package_zip(plan)
+
+
 def test_build_package_zip_raises_when_no_metadata(valid_plan_dict):
     # The shared plan has no metadata_artifact on any step.
     plan = Plan.model_validate(valid_plan_dict)
@@ -133,10 +213,13 @@ def test_build_package_zip_raises_when_no_metadata(valid_plan_dict):
 
 
 def test_build_package_zip_rejects_conflicting_file_bodies(valid_plan_dict):
+    # A non-aggregate file (permission set) emitted twice with different bodies
+    # is a genuine conflict. (Aggregate .object files merge instead — see
+    # test_same_object_files_from_different_steps_are_merged.)
     data = copy.deepcopy(valid_plan_dict)
     art = {
-        "files": [{"path": "objects/X.object", "body": "<A/>"}],
-        "members": [{"type": "CustomObject", "name": "X"}],
+        "files": [{"path": "permissionsets/X.permissionset", "body": "<A/>"}],
+        "members": [{"type": "PermissionSet", "name": "X"}],
     }
     data["steps"][0]["metadata_artifact"] = copy.deepcopy(art)
     conflicting = copy.deepcopy(art)

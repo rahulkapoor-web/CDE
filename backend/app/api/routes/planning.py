@@ -776,7 +776,9 @@ async def deploy_approved_plan(
             artifact_paths=payload.artifact_paths,
         )
 
-    # Fail fast with a clear message if there's nothing to deploy.
+    # Fail fast with a clear message if there's nothing to deploy, or if the
+    # package can't be assembled (e.g. genuinely conflicting metadata). Surface
+    # the reason to the UI instead of an opaque 500.
     try:
         build_package_zip(plan_schema, api_version=org_api_version)
     except NoDeployableMetadataError as exc:
@@ -787,6 +789,11 @@ async def deploy_approved_plan(
                 if (payload.step_numbers is None and payload.artifact_paths is None)
                 else "No deployable metadata in the selected steps/files."
             ),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not build the deployment package: {exc}",
         )
 
     if not payload.check_only:

@@ -19,11 +19,20 @@ import re
 import time
 import zipfile
 from dataclasses import dataclass, field
+from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
 from app.schemas.plan import Plan
 
 logger = logging.getLogger(__name__)
+
+_MDAPI_NS = "http://soap.sforce.com/2006/04/metadata"
+
+# MDAPI metadata types whose single file aggregates many child members (e.g. a
+# CustomObject file holds all fields, validationRules, listViews...). When two
+# steps each emit the same such file with different children, they must be MERGED
+# into one file rather than rejected as conflicting.
+_MERGEABLE_SUFFIXES = (".object", ".object-meta.xml")
 
 DEFAULT_API_VERSION = "60.0"
 
@@ -67,6 +76,56 @@ def _collect_members(plan: Plan) -> dict[str, list[str]]:
             if member.name not in names:
                 names.append(member.name)
     return by_type
+
+
+def _is_mergeable(path: str) -> bool:
+    """True for MDAPI files that aggregate child members (e.g. CustomObject)."""
+    p = path.lower()
+    return p.endswith(_MERGEABLE_SUFFIXES)
+
+
+def _child_key(el: ET.Element) -> tuple[str, str]:
+    """Identity of a CustomObject child for merge dedup.
+
+    Uses the element tag plus its <fullName> (the member name Salesforce keys on,
+    e.g. a field's API name). Children without a fullName fall back to their
+    serialized text so identical singletons don't duplicate.
+    """
+    tag = el.tag.split("}")[-1]
+    full = el.find(f"{{{_MDAPI_NS}}}fullName")
+    if full is None:
+        full = el.find("fullName")
+    name = (full.text or "").strip() if full is not None else ""
+    if not name:
+        name = ET.tostring(el, encoding="unicode")
+    return (tag, name)
+
+
+def _merge_object_xml(existing: str, incoming: str) -> str:
+    """Merge two CustomObject XML documents into one.
+
+    A CustomObject `.object` file must contain ALL of an object's members (every
+    field, validationRule, etc.). When separate plan steps each create a
+    different member on the same object, they emit the same `objects/X.object`
+    path with only their own child — deploying either alone, or rejecting them as
+    "conflicting", is wrong. This unions their child elements (dedup by
+    tag+fullName) so the object deploys with every member present.
+
+    Falls back to raising on unparseable XML so genuine corruption still surfaces.
+    """
+    ET.register_namespace("", _MDAPI_NS)
+    root_a = ET.fromstring(existing)
+    root_b = ET.fromstring(incoming)
+
+    seen = {_child_key(c) for c in list(root_a)}
+    for child in list(root_b):
+        key = _child_key(child)
+        if key not in seen:
+            root_a.append(child)
+            seen.add(key)
+
+    xml = ET.tostring(root_a, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
 
 
 def _is_meta_file(path: str) -> bool:
@@ -160,6 +219,19 @@ def build_package_zip(
             if _is_meta_file(path):
                 body = _normalize_api_version_in_body(body, resolved_version)
             if path in file_map and file_map[path] != body:
+                # Aggregate metadata (e.g. a CustomObject holding both a new
+                # field and a new validation rule from different steps) must be
+                # merged into one file, not rejected — the object file must carry
+                # every member or the deploy drops one.
+                if _is_mergeable(path):
+                    try:
+                        file_map[path] = _merge_object_xml(file_map[path], body)
+                        continue
+                    except ET.ParseError as exc:
+                        raise ValueError(
+                            f"Could not merge metadata file '{path}' across "
+                            f"steps: {exc}"
+                        )
                 raise ValueError(
                     f"Conflicting content for metadata file '{path}' across steps."
                 )
