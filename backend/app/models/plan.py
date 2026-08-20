@@ -16,6 +16,10 @@ class PlanStatus:
     # immediately (long LLM calls otherwise exceed the preview gateway timeout).
     GENERATING = "generating"
     GENERATION_FAILED = "generation_failed"
+    # Refinement also calls the LLM; it runs in the background too so the
+    # request returns immediately. The plan holds its previous content while
+    # REFINING and is restored to its prior status if refinement fails.
+    REFINING = "refining"
     GENERATED = "generated"
     APPROVED = "approved"
     DEPLOYING = "deploying"

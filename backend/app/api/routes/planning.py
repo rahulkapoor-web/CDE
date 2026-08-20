@@ -531,6 +531,88 @@ async def get_plan(
     return PlanOut.model_validate(plan)
 
 
+async def _run_refinement_background(
+    plan_id: int,
+    user_id: int,
+    feedback: str,
+    prev_status: str,
+) -> None:
+    """Refine a plan in the background and update the record in place.
+
+    Runs with its own DB session. The plan keeps its previous content while
+    ``REFINING``. On success the refined content replaces it and the lifecycle
+    is set based on ``prev_status`` (an already-approved plan stays approved so
+    the reviewer can redeploy immediately; otherwise it returns to
+    ``generated``). On failure the plan is restored to ``prev_status`` with the
+    error recorded in ``generation_error`` so the UI can show why.
+    """
+    async with AsyncSessionLocal() as db:
+        plan = await db.get(PlanModel, plan_id)
+        if plan is None:
+            logger.warning("Background refinement: plan %s vanished", plan_id)
+            return
+
+        ctx = PlanningContext.model_validate(plan.context_snapshot or {})
+        guide_context = ""
+        query = " ".join(
+            [ctx.jira_summary, ctx.jira_description, ctx.jira_acceptance_criteria]
+        ).strip()
+        try:
+            provider = get_llm_provider()
+            try:
+                guide_context = await retrieve_context(
+                    db, query or ctx.jira_ticket_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Guide retrieval failed: %s", exc)
+            refined, refined_dict = await refine_plan(
+                provider, ctx, plan.plan_json, feedback, guide_context
+            )
+        except PlanGenerationError as exc:
+            plan.status = prev_status
+            plan.generation_error = str(exc)
+            await db.commit()
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Background refinement failed for plan %s", plan_id)
+            plan.status = prev_status
+            plan.generation_error = f"Refinement failed: {exc}"
+            await db.commit()
+            return
+
+        refined_dict = _resolve_layout_edits(refined_dict, ctx)
+
+        # If the reviewer refines a plan they had already approved (typically to
+        # fix a failed deployment), keep it approved so they can redeploy
+        # immediately. Only a never-approved plan returns to `generated`.
+        was_approved = prev_status in (
+            PlanStatus.APPROVED,
+            PlanStatus.DEPLOYED,
+            PlanStatus.DEPLOY_FAILED,
+        )
+
+        plan.summary = refined.summary
+        plan.plan_json = refined_dict
+        plan.provider = provider.name
+        plan.model = getattr(provider, "_model", None)
+        plan.generation_error = None
+        # Clear prior deploy execution state; refined content must be redeployed.
+        plan.deploy_async_id = None
+        plan.deploy_started_at = None
+        plan.deploy_finished_at = None
+        plan.deploy_result = None
+        if was_approved:
+            plan.status = PlanStatus.APPROVED
+            plan.approved_at = func.now()
+            plan.approved_by_id = user_id
+        else:
+            plan.status = PlanStatus.GENERATED
+            plan.approved_at = None
+            plan.approved_by_id = None
+            plan.deploy_connection_id = None
+        await db.commit()
+
+
 @router.post("/plans/{plan_id}/refine", response_model=PlanOut)
 async def refine_existing_plan(
     plan_id: int,
@@ -541,84 +623,43 @@ async def refine_existing_plan(
     """Human-in-the-loop refinement: revise the same plan from reviewer feedback.
 
     The AI regenerates a refined version of the current plan incorporating the
-    feedback, in place (same record). Refinement resets the lifecycle back to
-    ``generated`` and clears any prior approval/deploy state, since the content
-    has changed and must be re-reviewed. A plan already deploying cannot be
-    refined.
+    feedback, in place (same record). Refinement runs in the background (the LLM
+    call otherwise exceeds the preview gateway timeout): the request returns
+    immediately with the plan in ``refining`` state, and the frontend polls
+    until it settles. On success an already-approved plan stays approved so it
+    can be redeployed; otherwise it returns to ``generated``. A plan already
+    deploying, generating, or refining cannot be refined.
     """
     feedback = (payload.feedback or "").strip()
     if not feedback:
         raise HTTPException(status_code=422, detail="Feedback must not be empty.")
 
     plan = await _owned_plan(db, user, plan_id)
-    if plan.status == PlanStatus.DEPLOYING:
+    if plan.status in (
+        PlanStatus.DEPLOYING,
+        PlanStatus.GENERATING,
+        PlanStatus.REFINING,
+    ):
         raise HTTPException(
             status_code=409,
-            detail="Cannot refine a plan while it is deploying.",
+            detail=f"Cannot refine a plan in status '{plan.status}'.",
         )
 
+    # Fail fast if the provider can't be constructed.
     try:
-        provider = get_llm_provider()
+        get_llm_provider()
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"LLM provider unavailable: {exc}")
 
-    ctx = PlanningContext.model_validate(plan.context_snapshot or {})
-
-    guide_context = ""
-    query = " ".join(
-        [ctx.jira_summary, ctx.jira_description, ctx.jira_acceptance_criteria]
-    ).strip()
-    try:
-        guide_context = await retrieve_context(db, query or ctx.jira_ticket_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Guide retrieval failed: %s", exc)
-
-    try:
-        refined, refined_dict = await refine_plan(
-            provider, ctx, plan.plan_json, feedback, guide_context
-        )
-    except PlanGenerationError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": str(exc),
-                "attempts": exc.attempts,
-                "errors": exc.last_errors,
-            },
-        )
-
-    refined_dict = _resolve_layout_edits(refined_dict, ctx)
-
-    # If the reviewer refines a plan they had already approved (typically to fix
-    # a failed deployment), keep it approved so they can redeploy immediately —
-    # they drove the change and will see the updated plan. Only a never-approved
-    # plan stays in `generated`.
-    was_approved = plan.status in (
-        PlanStatus.APPROVED,
-        PlanStatus.DEPLOYED,
-        PlanStatus.DEPLOY_FAILED,
-    )
-
-    plan.summary = refined.summary
-    plan.plan_json = refined_dict
-    plan.provider = provider.name
-    plan.model = getattr(provider, "_model", None)
-    # Clear prior deploy execution state; the refined content must be redeployed.
-    plan.deploy_async_id = None
-    plan.deploy_started_at = None
-    plan.deploy_finished_at = None
-    plan.deploy_result = None
-    if was_approved:
-        plan.status = PlanStatus.APPROVED
-        plan.approved_at = func.now()
-        plan.approved_by_id = user.id
-    else:
-        plan.status = PlanStatus.GENERATED
-        plan.approved_at = None
-        plan.approved_by_id = None
-        plan.deploy_connection_id = None
+    prev_status = plan.status
+    plan.status = PlanStatus.REFINING
+    plan.generation_error = None
     await db.commit()
     await db.refresh(plan)
+
+    asyncio.create_task(
+        _run_refinement_background(plan.id, user.id, feedback, prev_status)
+    )
     return PlanOut.model_validate(plan)
 
 

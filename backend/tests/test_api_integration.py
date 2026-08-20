@@ -81,6 +81,24 @@ async def _await_generation(client, headers, plan_id, timeout: float = 10.0) -> 
         await asyncio.sleep(0.05)
 
 
+async def _await_refinement(client, headers, plan_id, timeout: float = 10.0) -> dict:
+    """Poll a plan until background refinement leaves the 'refining' state."""
+    import asyncio
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        r = await client.get(f"/api/planning/plans/{plan_id}", headers=headers)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        if body["status"] != "refining":
+            return body
+        if asyncio.get_event_loop().time() > deadline:
+            raise AssertionError(
+                f"Plan {plan_id} stuck in 'refining' after {timeout}s"
+            )
+        await asyncio.sleep(0.05)
+
+
 @pytest.mark.asyncio
 async def test_full_flow(client, valid_plan_dict, monkeypatch):
     import uuid
@@ -601,13 +619,15 @@ async def test_refine_of_generated_plan_stays_generated(
     assert r.status_code == 422
 
     # Refining a never-approved plan keeps it in `generated` for review.
+    # Refinement is async: the POST returns the plan in `refining` immediately.
     r = await client.post(
         f"/api/planning/plans/{plan_id}/refine",
         headers=headers,
         json={"feedback": "Drop the validation rule; keep only the field."},
     )
     assert r.status_code == 200, r.text
-    body = r.json()
+    assert r.json()["status"] == "refining"
+    body = await _await_refinement(client, headers, plan_id)
     assert body["status"] == "generated"
     assert body["approved_at"] is None
     assert body["plan_json"]["summary"].startswith("Refined:")
@@ -644,12 +664,64 @@ async def test_refine_of_approved_plan_stays_approved(
         json={"feedback": "Fix the LWC bundle so it deploys."},
     )
     assert r.status_code == 200, r.text
-    body = r.json()
+    assert r.json()["status"] == "refining"
+    body = await _await_refinement(client, headers, plan_id)
     assert body["status"] == "approved"  # stays approved for redeploy
     assert body["approved_at"] is not None
     assert body["plan_json"]["summary"].startswith("Refined:")
     # Prior deploy execution state is cleared so the refined content redeploys.
     assert body["deploy_result"] is None
+
+
+@pytest.mark.asyncio
+async def test_refine_failure_restores_prior_status(
+    client, valid_plan_dict, monkeypatch
+):
+    """A failed refinement leaves the plan on its prior status with the content
+    unchanged and the error recorded, rather than stuck in 'refining'."""
+    import copy
+
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    first = _plan_dict_with_artifact(valid_plan_dict)
+
+    class RefineThenFail(FakeProvider):
+        def __init__(self, plan_dict):
+            super().__init__(plan_dict)
+            self._calls = 0
+
+        async def complete(self, system_prompt, user_prompt, **kwargs):
+            self._calls += 1
+            if self._calls == 1:
+                return LLMResult(
+                    text=json.dumps(self._plan), model="m", provider=self.name
+                )
+            # Refinement produces unparseable output -> generation error.
+            return LLMResult(text="not json", model="m", provider=self.name)
+
+    provider = RefineThenFail(first)
+    monkeypatch.setattr(planning_route, "get_llm_provider", lambda: provider)
+    monkeypatch.setattr("app.services.planner.settings.PLAN_MAX_RETRIES", 0)
+
+    plan_id = await _generate_plan(client, headers)
+    prev = copy.deepcopy(
+        (await client.get(f"/api/planning/plans/{plan_id}", headers=headers)).json()
+    )
+
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/refine",
+        headers=headers,
+        json={"feedback": "make it better"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "refining"
+
+    body = await _await_refinement(client, headers, plan_id)
+    # Restored to the pre-refine status with the original content intact.
+    assert body["status"] == prev["status"] == "generated"
+    assert body["plan_json"] == prev["plan_json"]
+    assert body["generation_error"]
 
 
 async def _create_gh_connection(client, headers) -> int:

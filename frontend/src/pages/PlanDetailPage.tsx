@@ -186,6 +186,9 @@ function StepCard({ step }: { step: PlanStep }) {
 }
 
 const STATUS_COLOR: Record<string, string> = {
+  generating: "processing",
+  generation_failed: "red",
+  refining: "processing",
   generated: "default",
   approved: "blue",
   deploying: "processing",
@@ -409,33 +412,34 @@ export default function PlanDetailPage() {
   const [ghBranch, setGhBranch] = useState("");
   const [ghResult, setGhResult] = useState<GithubCommitResult | null>(null);
 
+  // Initial load.
   useEffect(() => {
     if (!id) return;
+    planningApi
+      .getPlan(Number(id))
+      .then(setPlan)
+      .finally(() => setLoading(false));
+  }, [id]);
+
+  // Generation and refinement run in the background; whenever the plan enters a
+  // pending state (generating/refining), poll until it settles so the page
+  // updates on its own. Keyed on plan?.status so triggering a refine (which
+  // sets the plan to "refining" locally) starts polling without a reload.
+  const pendingState =
+    plan?.status === "generating" || plan?.status === "refining";
+  useEffect(() => {
+    if (!id || !pendingState) return;
     let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-
-    // Generation runs in the background; poll while the plan is still being
-    // generated so the page flips to the finished plan (or the failure) on its
-    // own without the user reloading.
-    const tick = async () => {
-      try {
-        const p = await planningApi.getPlan(Number(id));
-        if (cancelled) return;
-        setPlan(p);
-        if (p.status === "generating") {
-          timer = setTimeout(tick, 3000);
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-    tick();
-
+    const timer = setInterval(async () => {
+      const p = await planningApi.getPlan(Number(id));
+      if (cancelled) return;
+      setPlan(p);
+    }, 3000);
     return () => {
       cancelled = true;
-      if (timer) clearTimeout(timer);
+      clearInterval(timer);
     };
-  }, [id]);
+  }, [id, pendingState]);
 
   useEffect(() => {
     connectionsApi
@@ -560,10 +564,13 @@ export default function PlanDetailPage() {
     if (!plan) return;
     setRefining(true);
     try {
+      // Refinement runs in the background; the API returns the plan in a
+      // "refining" state immediately and the poll picks up the result. That
+      // avoids the preview gateway aborting the long LLM call.
       const updated = await planningApi.refine(plan.id, fb);
       setPlan(updated);
       setFeedback("");
-      message.success("Plan refined. Review the updated plan and approve when ready.");
+      message.success("Refining plan… this page updates when it's ready.");
     } catch (e) {
       message.error(errText(e, "Refinement failed"));
     } finally {
@@ -688,6 +695,20 @@ export default function PlanDetailPage() {
         icon={<Spin size="large" />}
         title="Generating plan…"
         subTitle="The AI is drafting your plan. This usually takes a minute or two — this page updates automatically."
+        extra={<Button onClick={() => navigate("/plans")}>← Back to plans</Button>}
+      />
+    );
+  }
+
+  // Background refinement in progress: the plan keeps its previous content, but
+  // show a spinner so the reviewer waits for the refined version rather than
+  // acting on the stale one. The poll flips the page back when it settles.
+  if (plan.status === "refining") {
+    return (
+      <Result
+        icon={<Spin size="large" />}
+        title="Refining plan…"
+        subTitle="The AI is revising the plan with your feedback. This usually takes a minute or two — this page updates automatically."
         extra={<Button onClick={() => navigate("/plans")}>← Back to plans</Button>}
       />
     );
@@ -818,6 +839,16 @@ export default function PlanDetailPage() {
             </Button>
           </Space>
         </Space>
+        {plan.generation_error && (
+          <Alert
+            style={{ marginTop: 12 }}
+            type="error"
+            showIcon
+            closable
+            message="Last refinement failed"
+            description={`${plan.generation_error} — the plan is unchanged. Adjust your feedback and try again.`}
+          />
+        )}
         {deployableCount === 0 && status !== "generated" && (
           <Alert
             style={{ marginTop: 12 }}
