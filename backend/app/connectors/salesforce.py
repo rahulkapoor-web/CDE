@@ -272,6 +272,7 @@ class SalesforceConnector:
         perms = _query_names(
             sf, "SELECT Name FROM PermissionSet WHERE IsOwnedByProfile = false", "Name"
         )
+        profiles = _query_names(sf, "SELECT Name FROM Profile", "Name")
         packages = _query_names(
             sf,
             "SELECT SubscriberPackage.Name FROM InstalledSubscriberPackage",
@@ -288,6 +289,7 @@ class SalesforceConnector:
             "metadata_flows": flows,
             "metadata_apex_classes": apex,
             "metadata_permission_sets": perms,
+            "metadata_profiles": profiles,
         }
 
     def _metadata_soap_url(self) -> str:

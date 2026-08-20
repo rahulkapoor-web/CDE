@@ -48,6 +48,28 @@ def build_user_prompt(
             )
         layout_block = "".join(parts)
 
+    enablement_block = ""
+    if ctx.enablement_target == "profile" and ctx.enablement_profiles:
+        names = ", ".join(ctx.enablement_profiles)
+        enablement_block = (
+            "\nACCESS ENABLEMENT: Grant any new access this story requires (field-"
+            "level security, object/tab/app visibility, Apex access) at the "
+            f"PROFILE level, on exactly these profiles: {names}. Emit the "
+            "corresponding Profile metadata (type Profile) as deployable "
+            "artifacts for each, and do NOT create or modify permission sets for "
+            "this access.\n"
+        )
+    elif ctx.enablement_target == "permission_set" and ctx.enablement_permission_sets:
+        names = ", ".join(ctx.enablement_permission_sets)
+        enablement_block = (
+            "\nACCESS ENABLEMENT: Grant any new access this story requires (field-"
+            "level security, object/tab/app visibility, Apex access) via "
+            f"PERMISSION SETS, on exactly these permission sets: {names}. Emit the "
+            "corresponding PermissionSet metadata (type PermissionSet) as "
+            "deployable artifacts for each, and do NOT modify profiles for this "
+            "access.\n"
+        )
+
     design_block = (
         "\nDESIGN REFERENCE: One or more UI design images (e.g. a Figma export) "
         "are attached. Treat them as the target UI. Derive required fields, "
@@ -89,6 +111,6 @@ GitHub Repo State:
 {_bullets(ctx.github_recent_commits)}
   - Open PRs:
 {_bullets(ctx.github_open_prs)}
-{guide_block}{layout_block}{design_block}
+{guide_block}{enablement_block}{layout_block}{design_block}
 Use plan_id = "{plan_id}" and jira_ticket = "{ctx.jira_ticket_id}".
 Return ONLY the JSON object, with no surrounding text or code fences."""

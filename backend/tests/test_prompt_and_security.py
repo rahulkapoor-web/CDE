@@ -34,6 +34,35 @@ def test_user_prompt_notes_missing_guide_context():
     assert "No LSC guide excerpts" in prompt
 
 
+def test_user_prompt_enablement_profile():
+    ctx = PlanningContext(
+        jira_ticket_id="X",
+        enablement_target="profile",
+        enablement_profiles=["System Administrator", "Sales User"],
+    )
+    prompt = build_user_prompt(ctx)
+    assert "PROFILE level" in prompt
+    assert "System Administrator, Sales User" in prompt
+    assert "type Profile" in prompt
+
+
+def test_user_prompt_enablement_permission_set():
+    ctx = PlanningContext(
+        jira_ticket_id="X",
+        enablement_target="permission_set",
+        enablement_permission_sets=["PS_Sales"],
+    )
+    prompt = build_user_prompt(ctx)
+    assert "PERMISSION SETS" in prompt
+    assert "PS_Sales" in prompt
+    assert "type PermissionSet" in prompt
+
+
+def test_user_prompt_no_enablement_when_unset():
+    prompt = build_user_prompt(PlanningContext(jira_ticket_id="X"))
+    assert "ACCESS ENABLEMENT" not in prompt
+
+
 def test_user_prompt_includes_guide_context_when_present():
     prompt = build_user_prompt(
         PlanningContext(jira_ticket_id="X"), guide_context="SECTION 3.2 details"

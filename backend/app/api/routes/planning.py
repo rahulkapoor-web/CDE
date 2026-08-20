@@ -534,19 +534,34 @@ async def refine_existing_plan(
 
     refined_dict = _resolve_layout_edits(refined_dict, ctx)
 
+    # If the reviewer refines a plan they had already approved (typically to fix
+    # a failed deployment), keep it approved so they can redeploy immediately —
+    # they drove the change and will see the updated plan. Only a never-approved
+    # plan stays in `generated`.
+    was_approved = plan.status in (
+        PlanStatus.APPROVED,
+        PlanStatus.DEPLOYED,
+        PlanStatus.DEPLOY_FAILED,
+    )
+
     plan.summary = refined.summary
     plan.plan_json = refined_dict
     plan.provider = provider.name
     plan.model = getattr(provider, "_model", None)
-    # Content changed -> require re-review; clear approval and deploy state.
-    plan.status = PlanStatus.GENERATED
-    plan.approved_at = None
-    plan.approved_by_id = None
-    plan.deploy_connection_id = None
+    # Clear prior deploy execution state; the refined content must be redeployed.
     plan.deploy_async_id = None
     plan.deploy_started_at = None
     plan.deploy_finished_at = None
     plan.deploy_result = None
+    if was_approved:
+        plan.status = PlanStatus.APPROVED
+        plan.approved_at = func.now()
+        plan.approved_by_id = user.id
+    else:
+        plan.status = PlanStatus.GENERATED
+        plan.approved_at = None
+        plan.approved_by_id = None
+        plan.deploy_connection_id = None
     await db.commit()
     await db.refresh(plan)
     return PlanOut.model_validate(plan)

@@ -11,7 +11,10 @@ import type {
   PlanSummary,
 } from "../types";
 
-const api = axios.create({ baseURL: "/api" });
+// Plan generation/refine are long-running (LLM latency, up to a few minutes).
+// Give requests a generous 10-minute ceiling so the client waits for the plan
+// instead of surfacing a false failure while the backend is still working.
+const api = axios.create({ baseURL: "/api", timeout: 600000 });
 
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem("token");

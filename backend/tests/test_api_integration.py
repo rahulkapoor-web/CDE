@@ -533,7 +533,7 @@ class RefiningProvider(FakeProvider):
 
 
 @pytest.mark.asyncio
-async def test_refine_revises_plan_and_resets_lifecycle(
+async def test_refine_of_generated_plan_stays_generated(
     client, valid_plan_dict, monkeypatch
 ):
     import copy
@@ -550,10 +550,6 @@ async def test_refine_revises_plan_and_resets_lifecycle(
 
     plan_id = await _generate_plan(client, headers)
 
-    # Approve first so we can prove refine resets the lifecycle.
-    r = await client.post(f"/api/planning/plans/{plan_id}/approve", headers=headers)
-    assert r.json()["status"] == "approved"
-
     # Empty feedback is rejected.
     r = await client.post(
         f"/api/planning/plans/{plan_id}/refine",
@@ -562,7 +558,7 @@ async def test_refine_revises_plan_and_resets_lifecycle(
     )
     assert r.status_code == 422
 
-    # Refine with real feedback.
+    # Refining a never-approved plan keeps it in `generated` for review.
     r = await client.post(
         f"/api/planning/plans/{plan_id}/refine",
         headers=headers,
@@ -570,12 +566,48 @@ async def test_refine_revises_plan_and_resets_lifecycle(
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["status"] == "generated"  # reset for re-review
+    assert body["status"] == "generated"
     assert body["approved_at"] is None
     assert body["plan_json"]["summary"].startswith("Refined:")
-    # The refine prompt carried the reviewer feedback and the current plan.
     assert "Drop the validation rule" in provider.last_refine_prompt
     assert "CURRENT PLAN JSON" in provider.last_refine_prompt
+
+
+@pytest.mark.asyncio
+async def test_refine_of_approved_plan_stays_approved(
+    client, valid_plan_dict, monkeypatch
+):
+    """Refining an already-approved plan (e.g. to fix a failed deploy) must keep
+    it approved so the reviewer can redeploy without re-approving."""
+    import copy
+
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    first = _plan_dict_with_artifact(valid_plan_dict)
+    second = copy.deepcopy(first)
+    second["summary"] = "Refined: fixed the failing component."
+
+    provider = RefiningProvider(first, second)
+    monkeypatch.setattr(planning_route, "get_llm_provider", lambda: provider)
+
+    plan_id = await _generate_plan(client, headers)
+
+    r = await client.post(f"/api/planning/plans/{plan_id}/approve", headers=headers)
+    assert r.json()["status"] == "approved"
+
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/refine",
+        headers=headers,
+        json={"feedback": "Fix the LWC bundle so it deploys."},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "approved"  # stays approved for redeploy
+    assert body["approved_at"] is not None
+    assert body["plan_json"]["summary"].startswith("Refined:")
+    # Prior deploy execution state is cleared so the refined content redeploys.
+    assert body["deploy_result"] is None
 
 
 async def _create_gh_connection(client, headers) -> int:

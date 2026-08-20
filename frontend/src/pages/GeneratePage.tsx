@@ -97,11 +97,23 @@ export default function GeneratePage() {
     setGenerating(true);
     try {
       const ctx = fromFormValues(values);
-      // jira_images and existing_layouts are not form fields; carry them from
-      // the gathered context so the backend still receives the ticket's
-      // attachments AND the org's real layout XML on generate. Without the
-      // latter, layout_edits cannot be merged into the real layout and the
-      // deploy fails ("must contain an item for required layout field: Name").
+      // The Salesforce org-context fields are no longer shown in the form; carry
+      // the gathered values through so the planner still receives full org
+      // context (edition, objects, fields, flows, apex, permission sets,
+      // packages, profiles). jira_images and existing_layouts are likewise not
+      // form fields — the latter is required so layout_edits merge into the real
+      // layout (else deploy fails on "required layout field: Name").
+      if (context) {
+        ctx.sf_org_edition = context.sf_org_edition ?? "";
+        ctx.lsc_modules = context.lsc_modules ?? [];
+        ctx.installed_packages = context.installed_packages ?? [];
+        ctx.metadata_objects = context.metadata_objects ?? [];
+        ctx.metadata_fields = context.metadata_fields ?? [];
+        ctx.metadata_flows = context.metadata_flows ?? [];
+        ctx.metadata_apex_classes = context.metadata_apex_classes ?? [];
+        ctx.metadata_permission_sets = context.metadata_permission_sets ?? [];
+        ctx.metadata_profiles = context.metadata_profiles ?? [];
+      }
       ctx.jira_images = context?.jira_images ?? [];
       ctx.existing_layouts = context?.existing_layouts ?? {};
       const files = designFiles
@@ -212,49 +224,83 @@ export default function GeneratePage() {
               <TextArea rows={3} />
             </Form.Item>
 
-            <Divider orientation="left">Salesforce Org Context</Divider>
-            <Row gutter={12}>
-              <Col span={8}>
-                <Form.Item name="sf_org_edition" label="Org edition">
-                  <Input />
-                </Form.Item>
-              </Col>
-              <Col span={16}>
-                <Form.Item name="lsc_modules" label="LSC modules active">
-                  <Select mode="tags" tokenSeparators={[","]} />
-                </Form.Item>
-              </Col>
-            </Row>
-            <Form.Item name="metadata_objects" label="Relevant objects">
-              <Select mode="tags" tokenSeparators={[","]} />
+            <Divider orientation="left">Access Enablement</Divider>
+            <Form.Item
+              name="enablement_target"
+              label="Enable new access via"
+              extra="Choose how the plan should grant access for anything this story adds (field-level security, object/tab/app visibility, Apex access)."
+            >
+              <Select
+                allowClear
+                placeholder="Select mechanism"
+                options={[
+                  { value: "profile", label: "Profile" },
+                  { value: "permission_set", label: "Permission Set" },
+                ]}
+              />
             </Form.Item>
-            <Form.Item name="metadata_fields" label="Relevant fields">
-              <Select mode="tags" tokenSeparators={[","]} />
+            <Form.Item
+              noStyle
+              shouldUpdate={(prev, cur) =>
+                prev.enablement_target !== cur.enablement_target
+              }
+            >
+              {({ getFieldValue }) => {
+                const target = getFieldValue("enablement_target");
+                if (target === "profile") {
+                  return (
+                    <Form.Item
+                      name="enablement_profiles"
+                      label="Profiles"
+                      rules={[
+                        {
+                          required: true,
+                          message: "Select at least one profile",
+                        },
+                      ]}
+                    >
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        placeholder="Select profiles to enable"
+                        options={(context?.metadata_profiles ?? []).map((p) => ({
+                          value: p,
+                          label: p,
+                        }))}
+                        showSearch
+                        optionFilterProp="label"
+                      />
+                    </Form.Item>
+                  );
+                }
+                if (target === "permission_set") {
+                  return (
+                    <Form.Item
+                      name="enablement_permission_sets"
+                      label="Permission sets"
+                      rules={[
+                        {
+                          required: true,
+                          message: "Select at least one permission set",
+                        },
+                      ]}
+                    >
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        placeholder="Select permission sets to enable"
+                        options={(context?.metadata_permission_sets ?? []).map(
+                          (p) => ({ value: p, label: p }),
+                        )}
+                        showSearch
+                        optionFilterProp="label"
+                      />
+                    </Form.Item>
+                  );
+                }
+                return null;
+              }}
             </Form.Item>
-            <Row gutter={12}>
-              <Col span={12}>
-                <Form.Item name="metadata_flows" label="Relevant flows">
-                  <Select mode="tags" tokenSeparators={[","]} />
-                </Form.Item>
-              </Col>
-              <Col span={12}>
-                <Form.Item name="metadata_apex_classes" label="Relevant Apex classes">
-                  <Select mode="tags" tokenSeparators={[","]} />
-                </Form.Item>
-              </Col>
-            </Row>
-            <Row gutter={12}>
-              <Col span={12}>
-                <Form.Item name="metadata_permission_sets" label="Permission sets">
-                  <Select mode="tags" tokenSeparators={[","]} />
-                </Form.Item>
-              </Col>
-              <Col span={12}>
-                <Form.Item name="installed_packages" label="Installed packages">
-                  <Select mode="tags" tokenSeparators={[","]} />
-                </Form.Item>
-              </Col>
-            </Row>
 
             <Divider orientation="left">GitHub Context</Divider>
             <Form.Item name="github_branch" label="Branch">
@@ -324,6 +370,9 @@ function fromFormValues(values: Record<string, unknown>): PlanningContext {
     "metadata_flows",
     "metadata_apex_classes",
     "metadata_permission_sets",
+    "metadata_profiles",
+    "enablement_profiles",
+    "enablement_permission_sets",
     "github_recent_commits",
     "github_open_prs",
   ];
@@ -341,6 +390,7 @@ function fromFormValues(values: Record<string, unknown>): PlanningContext {
     "jira_type",
     "jira_priority",
     "sf_org_edition",
+    "enablement_target",
     "github_branch",
   ];
   stringFields.forEach((f) => {

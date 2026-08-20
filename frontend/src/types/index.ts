@@ -43,6 +43,11 @@ export interface PlanningContext {
   metadata_flows: string[];
   metadata_apex_classes: string[];
   metadata_permission_sets: string[];
+  metadata_profiles: string[];
+  // Enablement mechanism chosen up front: "" | "profile" | "permission_set".
+  enablement_target: string;
+  enablement_profiles: string[];
+  enablement_permission_sets: string[];
   github_branch: string;
   github_recent_commits: string[];
   github_open_prs: string[];

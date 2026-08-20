@@ -229,7 +229,12 @@ class _MetaSF:
             ],
         }
 
-    def query_all(self, *_a, **_k):  # SOQL helpers -> treated as empty
+    def query_all(self, soql="", *_a, **_k):
+        # Return names for the enablement SOQL helpers; empty otherwise.
+        if "FROM Profile" in soql:
+            return {"records": [{"Name": "System Administrator"}, {"Name": "Sales User"}]}
+        if "FROM PermissionSet" in soql:
+            return {"records": [{"Name": "PS_Sales"}, {"Name": "PS_Service"}]}
         return {"records": []}
 
     def __getattr__(self, item):
@@ -292,3 +297,14 @@ def test_fetch_metadata_explicit_object_names_override_focus(monkeypatch):
     # Explicit object_names win; focus_text is ignored when names are given.
     assert data["metadata_objects"] == ["Contact"]
     assert fake.described == ["Contact"]
+
+
+def test_fetch_metadata_includes_profiles_and_permission_sets(monkeypatch):
+    fake = _MetaSF(["Account", "Visit__c"])
+    c = _connector_with_fake(monkeypatch, fake)
+
+    data = c.fetch_metadata()
+
+    # Profiles and permission sets populate the enablement selector.
+    assert data["metadata_profiles"] == ["System Administrator", "Sales User"]
+    assert data["metadata_permission_sets"] == ["PS_Sales", "PS_Service"]

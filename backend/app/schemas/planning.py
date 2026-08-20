@@ -46,6 +46,17 @@ class PlanningContext(BaseModel):
     metadata_flows: list[str] = []
     metadata_apex_classes: list[str] = []
     metadata_permission_sets: list[str] = []
+    # Assignable profiles in the org, used to populate the enablement selector.
+    metadata_profiles: list[str] = []
+
+    # How new access (fields, objects, tabs, apps) should be enabled. The
+    # reviewer chooses the mechanism up front and the specific targets, so the
+    # planner grants access the way this org manages permissions instead of
+    # guessing. ``enablement_target`` is "profile" or "permission_set" (or "" if
+    # unspecified). Only the matching list is populated.
+    enablement_target: str = ""
+    enablement_profiles: list[str] = []
+    enablement_permission_sets: list[str] = []
 
     # Existing Layout XML keyed by full name (e.g. "Account-Account Layout"),
     # retrieved from the org so the planner can modify the REAL layout rather
