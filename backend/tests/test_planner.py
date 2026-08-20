@@ -140,6 +140,9 @@ async def test_refine_prompt_includes_deploy_error_guidance(valid_plan_dict):
     assert "NEVER invent" in prompt
     # The concrete error text must be carried through to the model.
     assert "Account.Bogus__c" in prompt
+    # And the model must be told to make minimal changes so it doesn't loop
+    # through errors by rewriting unrelated files each pass.
+    assert "AVOID ERROR LOOPS" in prompt
 
 
 @pytest.mark.asyncio

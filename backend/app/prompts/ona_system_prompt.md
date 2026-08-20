@@ -75,7 +75,7 @@ The exact structure and types of every field are below. Match these types precis
         "members": [
           { "type": "CustomField", "name": "HealthCondition.Diagnosis_Code__c" }
         ],
-        "api_version": "60.0"
+        "api_version": "{ORG_API_VERSION}"
       },
       "acceptance_check": "string",
       "estimated_minutes": 30,
@@ -180,11 +180,12 @@ Key differences in MDAPI format:
    `{ "type": "Layout", ... }` member yourself — the backend generates the full
    `.layout` file and its package member from `layout_edits`.
 
-   Apex class — TWO files: `classes/Foo.cls` (the code) and `classes/Foo.cls-meta.xml`:
+   Apex class — TWO files: `classes/Foo.cls` (the code) and `classes/Foo.cls-meta.xml`.
+   Set `<apiVersion>` to the **Org API Version** given in the INPUTS (not a hardcoded value):
    ```xml
    <?xml version="1.0" encoding="UTF-8"?>
    <ApexClass xmlns="http://soap.sforce.com/2006/04/metadata">
-       <apiVersion>60.0</apiVersion>
+       <apiVersion>{ORG_API_VERSION}</apiVersion>
        <status>Active</status>
    </ApexClass>
    ```
@@ -197,7 +198,7 @@ Key differences in MDAPI format:
    ```xml
    <?xml version="1.0" encoding="UTF-8"?>
    <LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata">
-       <apiVersion>60.0</apiVersion>
+       <apiVersion>{ORG_API_VERSION}</apiVersion>
        <isExposed>true</isExposed>
        <targets>
            <target>lightning__RecordPage</target>
@@ -212,7 +213,7 @@ Key differences in MDAPI format:
 
 Consistency rules:
 - Every `members` entry MUST be backed by the file(s) in `files` (and vice versa), so the generated package.xml matches the package contents.
-- Use one consistent `api_version` (e.g. "60.0") across the plan.
+- Set `api_version` and every `<apiVersion>` in Apex/LWC meta files to the **Org API Version** from the INPUTS, consistently across the whole plan. Do NOT invent or hardcode a version. (The deployer also enforces the org's version at deploy time, but author it correctly so the plan reads accurately.)
 - Keep paths POSIX (forward slashes). Use MDAPI extensions (no `-meta.xml` except for Apex/LWC).
 - **Multi-file components deploy atomically — keep each in ONE step.** An LWC bundle (html+js+js-meta.xml) or an Apex class (cls+cls-meta.xml) must be emitted together in a single step, not spread across steps; a package containing only part of a bundle is rejected.
 - **A FlexiPage or component that references another component/field can only deploy if that dependency is in the SAME package or already in the org.** If a step emits a FlexiPage that embeds an LWC, emit the LWC in the same plan (an earlier step) and add a dependency; never reference a component that does not exist in the org and is not created by this plan.

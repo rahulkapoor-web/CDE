@@ -282,6 +282,7 @@ class SalesforceConnector:
 
         return {
             "sf_org_edition": describe.get("organizationType") or "",
+            "sf_api_version": self.get_api_version(),
             "lsc_modules": _detect_lsc_modules(all_objects),
             "installed_packages": packages,
             "metadata_objects": objects,
@@ -291,6 +292,39 @@ class SalesforceConnector:
             "metadata_permission_sets": perms,
             "metadata_profiles": profiles,
         }
+
+    def get_api_version(self) -> str:
+        """Return the org's highest supported API version (e.g. "62.0").
+
+        Queries the unauthenticated ``/services/data/`` discovery endpoint, which
+        lists every API version the org supports; the last entry is the newest.
+        This is the org's real ceiling — authoring Apex/LWC against a version the
+        org does not support (or a stale hardcoded default) causes deploy
+        failures, so callers use this to ground metadata to the target org.
+        Falls back to the client default on any error so callers never crash.
+        """
+        default = getattr(self.sf, "sf_version", "60.0") if self.sf else "60.0"
+        base = self.instance_url
+        token = self.access_token
+        if not base or not token:
+            return default
+        try:
+            with httpx.Client(timeout=15, follow_redirects=True) as client:
+                resp = client.get(
+                    f"{base}/services/data/",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            resp.raise_for_status()
+            versions = resp.json()
+            if isinstance(versions, list) and versions:
+                # Pick the numerically highest "version" string.
+                latest = max(
+                    versions, key=lambda v: float(v.get("version", "0") or 0)
+                )
+                return str(latest.get("version") or default)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not determine org API version: %s", exc)
+        return default
 
     def _metadata_soap_url(self) -> str:
         # simple-salesforce exposes sf_version on the connected client.

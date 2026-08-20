@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -25,6 +26,14 @@ from app.schemas.plan import Plan
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_VERSION = "60.0"
+
+# Matches the version element inside Apex/LWC/Aura meta files, e.g.
+# <apiVersion>60.0</apiVersion>. Case-insensitive on the tag so both the
+# metadata <apiVersion> and any stray <version> in a meta file are normalized.
+_API_VERSION_RE = re.compile(
+    r"(<(?P<tag>apiVersion|version)>)\s*[\d.]+\s*(</(?P=tag)>)",
+    re.IGNORECASE,
+)
 
 # Terminal deploy states reported by the Metadata API.
 _TERMINAL_STATES = {"Succeeded", "Failed", "Canceled", "SucceededPartial"}
@@ -60,16 +69,49 @@ def _collect_members(plan: Plan) -> dict[str, list[str]]:
     return by_type
 
 
+def _is_meta_file(path: str) -> bool:
+    """True for Apex/LWC/Aura meta files that carry an <apiVersion> element."""
+    p = path.lower()
+    return p.endswith("-meta.xml")
+
+
+def _normalize_api_version_in_body(body: str, api_version: str) -> str:
+    """Rewrite any <apiVersion>/<version> element in a meta file to the org's.
+
+    LLM-authored Apex ``.cls-meta.xml`` and LWC ``.js-meta.xml`` files hardcode
+    an apiVersion (often a stale default) that may not match the target org,
+    which causes deploy failures and drives the fix-with-AI error loop. Forcing
+    every meta file to the org's real API version at build time makes deploys
+    deterministic regardless of what the model emitted.
+    """
+    return _API_VERSION_RE.sub(
+        lambda m: f"{m.group(1)}{api_version}{m.group(3)}", body
+    )
+
+
+def _resolve_api_version(plan: Plan, api_version: str) -> str:
+    """Pick the API version for the package.
+
+    The caller-provided ``api_version`` (the org's real version, when known) is
+    authoritative. Only when it is the built-in default do we fall back to the
+    first artifact-specified version, so an explicitly passed org version always
+    wins over whatever the LLM wrote.
+    """
+    if api_version and api_version != DEFAULT_API_VERSION:
+        return api_version
+    for step in plan.steps:
+        if step.metadata_artifact and step.metadata_artifact.api_version:
+            return step.metadata_artifact.api_version
+    return api_version
+
+
 def build_package_xml(plan: Plan, api_version: str = DEFAULT_API_VERSION) -> str:
     """Render a package.xml from the merged members of all steps.
 
-    api_version resolution: the first step artifact that specifies an
-    ``api_version`` wins; otherwise the provided default is used.
+    ``api_version`` is the org's real API version when known; it wins over any
+    artifact-specified version so the package always targets the org's version.
     """
-    for step in plan.steps:
-        if step.metadata_artifact and step.metadata_artifact.api_version:
-            api_version = step.metadata_artifact.api_version
-            break
+    api_version = _resolve_api_version(plan, api_version)
 
     by_type = _collect_members(plan)
     lines = ['<?xml version="1.0" encoding="UTF-8"?>']
@@ -93,6 +135,7 @@ def build_package_zip(
     Raises NoDeployableMetadataError if no step carries a metadata_artifact.
     Raises ValueError on duplicate or empty file paths.
     """
+    resolved_version = _resolve_api_version(plan, api_version)
     file_map: dict[str, str] = {}
     steps_included: list[int] = []
 
@@ -111,11 +154,16 @@ def build_package_zip(
                 raise ValueError(
                     "Steps must not provide package.xml; it is generated."
                 )
-            if path in file_map and file_map[path] != f.body:
+            body = f.body
+            # Force Apex/LWC meta files to the org's API version so a stale or
+            # inconsistent LLM-authored apiVersion never fails the deploy.
+            if _is_meta_file(path):
+                body = _normalize_api_version_in_body(body, resolved_version)
+            if path in file_map and file_map[path] != body:
                 raise ValueError(
                     f"Conflicting content for metadata file '{path}' across steps."
                 )
-            file_map[path] = f.body
+            file_map[path] = body
 
     if not file_map:
         raise NoDeployableMetadataError(

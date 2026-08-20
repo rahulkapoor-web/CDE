@@ -159,6 +159,13 @@ def _build_refine_prompt(
         "component that is not present in the org context — if a referenced "
         "field does not exist, either add an explicit earlier step to create it "
         "(with its metadata_artifact) or remove the reference.\n\n"
+        "AVOID ERROR LOOPS: make the MINIMAL change that fixes the named error "
+        "and leave every other file byte-for-byte identical to the current plan. "
+        "Do NOT re-edit files the error does not mention, do NOT change the "
+        "apiVersion (use the Org API Version from the INPUTS everywhere; the "
+        "deployer also enforces the org's version automatically), and do NOT undo "
+        "a fix from a previous revision. If unsure why a component failed, keep "
+        "the current content rather than rewriting it.\n\n"
         "CURRENT PLAN JSON:\n"
         + current_json
         + "\n\nREVIEWER FEEDBACK:\n"

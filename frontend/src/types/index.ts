@@ -36,6 +36,8 @@ export interface PlanningContext {
   jira_priority: string;
   jira_images: JiraImage[];
   sf_org_edition: string;
+  // Target org's highest supported API version (e.g. "62.0").
+  sf_api_version: string;
   lsc_modules: string[];
   installed_packages: string[];
   metadata_objects: string[];

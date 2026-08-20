@@ -91,6 +91,7 @@ Ticket Type:          {ctx.jira_type}
 Priority:             {ctx.jira_priority}
 
 Current Org Edition:  {ctx.sf_org_edition}
+Org API Version:      {ctx.sf_api_version or "(unknown)"}  <-- author ALL Apex/LWC apiVersion and package versions to EXACTLY this value
 LSC Modules Active:   {", ".join(ctx.lsc_modules) or "(unknown)"}
 Installed Packages:   {", ".join(ctx.installed_packages) or "(unknown)"}
 Org Metadata Snapshot:

@@ -434,11 +434,17 @@ async def test_approve_then_deploy_success(client, valid_plan_dict, monkeypatch)
         def connect(self):
             return object()
 
+        def get_api_version(self):
+            return "62.0"
+
     monkeypatch.setattr(
         planning_route, "salesforce_from_connection", lambda conn: _Connector()
     )
 
-    def _fake_deploy(sf, plan, *, is_sandbox, check_only=False, **kw):
+    seen = {}
+
+    def _fake_deploy(sf, plan, *, is_sandbox, check_only=False, api_version=None, **kw):
+        seen["api_version"] = api_version
         return "0AfXYZ", {
             "state": "Succeeded",
             "succeeded": True,
@@ -460,6 +466,9 @@ async def test_approve_then_deploy_success(client, valid_plan_dict, monkeypatch)
     assert body["status"] == "deployed"
     assert body["deploy_async_id"] == "0AfXYZ"
     assert body["deploy_result"]["succeeded"] is True
+    # The org's real API version is passed through to the deployer so metadata is
+    # grounded to the target org rather than a hardcoded default.
+    assert seen["api_version"] == "62.0"
 
 
 @pytest.mark.asyncio

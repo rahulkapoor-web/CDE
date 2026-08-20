@@ -308,3 +308,75 @@ def test_fetch_metadata_includes_profiles_and_permission_sets(monkeypatch):
     # Profiles and permission sets populate the enablement selector.
     assert data["metadata_profiles"] == ["System Administrator", "Sales User"]
     assert data["metadata_permission_sets"] == ["PS_Sales", "PS_Service"]
+
+
+class _VersionClient:
+    """Stubs httpx.Client for the /services/data/ version discovery call."""
+
+    payload: list = [
+        {"version": "60.0"},
+        {"version": "62.0"},
+        {"version": "61.0"},
+    ]
+    status_code = 200
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, headers=None):
+        _VersionClient.last_url = url
+        return _VersionResponse(type(self).status_code, type(self).payload)
+
+
+class _VersionResponse:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+def test_get_api_version_returns_highest_supported(monkeypatch):
+    monkeypatch.setattr(
+        "app.connectors.salesforce.httpx.Client", _VersionClient
+    )
+    _VersionClient.status_code = 200
+    _VersionClient.payload = [
+        {"version": "60.0"},
+        {"version": "62.0"},
+        {"version": "61.0"},
+    ]
+    c = SalesforceConnector(
+        auth_flow="access_token",
+        access_token="T",
+        instance_url="https://acme.my.salesforce.com",
+    )
+
+    # Numerically highest, not last-in-list, is chosen.
+    assert c.get_api_version() == "62.0"
+    assert _VersionClient.last_url.endswith("/services/data/")
+
+
+def test_get_api_version_falls_back_on_error(monkeypatch):
+    monkeypatch.setattr(
+        "app.connectors.salesforce.httpx.Client", _VersionClient
+    )
+    _VersionClient.status_code = 500
+    c = SalesforceConnector(
+        auth_flow="access_token",
+        access_token="T",
+        instance_url="https://acme.my.salesforce.com",
+    )
+    # On HTTP error it returns the safe default rather than raising.
+    assert c.get_api_version() == "60.0"

@@ -39,6 +39,11 @@ class PlanningContext(BaseModel):
     jira_images: list[JiraImage] = []
 
     sf_org_edition: str = ""
+    # The target org's highest supported API version (e.g. "62.0"), fetched from
+    # the org. Apex/LWC metadata must be authored against this exact version, and
+    # the deployer enforces it on every artifact so deploys never fail on a
+    # mismatched apiVersion.
+    sf_api_version: str = ""
     lsc_modules: list[str] = []
     installed_packages: list[str] = []
     metadata_objects: list[str] = []

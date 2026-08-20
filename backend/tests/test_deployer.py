@@ -73,6 +73,58 @@ def test_package_xml_lists_types_and_members(valid_plan_dict):
     assert "<version>60.0</version>" in xml
 
 
+def _plan_with_apex(base: dict, meta_version: str) -> Plan:
+    """Plan whose first step ships an Apex class whose meta declares a version."""
+    data = copy.deepcopy(base)
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {"path": "classes/Foo.cls", "body": "public class Foo {}"},
+            {
+                "path": "classes/Foo.cls-meta.xml",
+                "body": (
+                    '<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<ApexClass xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+                    f"    <apiVersion>{meta_version}</apiVersion>\n"
+                    "    <status>Active</status>\n"
+                    "</ApexClass>\n"
+                ),
+            },
+        ],
+        "members": [{"type": "ApexClass", "name": "Foo"}],
+        "api_version": meta_version,
+    }
+    return Plan.model_validate(data)
+
+
+def _read_zip(pkg) -> dict[str, str]:
+    zf = zipfile.ZipFile(io.BytesIO(pkg.zip_bytes))
+    return {n: zf.read(n).decode() for n in zf.namelist()}
+
+
+def test_org_api_version_overrides_meta_and_package(valid_plan_dict):
+    """The org's API version rewrites the meta file's apiVersion and package.xml
+    version, so a stale LLM-authored version never reaches the org."""
+    plan = _plan_with_apex(valid_plan_dict, meta_version="55.0")
+    pkg = build_package_zip(plan, api_version="62.0")
+
+    files = _read_zip(pkg)
+    assert "<version>62.0</version>" in files["package.xml"]
+    assert "<version>55.0</version>" not in files["package.xml"]
+    meta = files["classes/Foo.cls-meta.xml"]
+    assert "<apiVersion>62.0</apiVersion>" in meta
+    assert "55.0" not in meta
+    # The Apex body itself is untouched.
+    assert files["classes/Foo.cls"] == "public class Foo {}"
+
+
+def test_default_api_version_falls_back_to_artifact(valid_plan_dict):
+    """When the caller passes the built-in default (org version unknown), the
+    artifact-declared version is used rather than clobbering it."""
+    plan = _plan_with_apex(valid_plan_dict, meta_version="58.0")
+    xml = build_package_xml(plan)  # default DEFAULT_API_VERSION
+    assert "<version>58.0</version>" in xml
+
+
 def test_build_package_zip_raises_when_no_metadata(valid_plan_dict):
     # The shared plan has no metadata_artifact on any step.
     plan = Plan.model_validate(valid_plan_dict)

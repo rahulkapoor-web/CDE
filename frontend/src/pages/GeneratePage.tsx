@@ -105,6 +105,7 @@ export default function GeneratePage() {
       // layout (else deploy fails on "required layout field: Name").
       if (context) {
         ctx.sf_org_edition = context.sf_org_edition ?? "";
+        ctx.sf_api_version = context.sf_api_version ?? "";
         ctx.lsc_modules = context.lsc_modules ?? [];
         ctx.installed_packages = context.installed_packages ?? [];
         ctx.metadata_objects = context.metadata_objects ?? [];
@@ -394,6 +395,7 @@ function fromFormValues(values: Record<string, unknown>): PlanningContext {
     "jira_type",
     "jira_priority",
     "sf_org_edition",
+    "sf_api_version",
     "enablement_target",
     "github_branch",
   ];

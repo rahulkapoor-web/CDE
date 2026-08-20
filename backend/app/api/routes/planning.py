@@ -56,6 +56,7 @@ from app.services.connections import (
     salesforce_from_connection,
 )
 from app.services.deployer import (
+    DEFAULT_API_VERSION,
     NoDeployableMetadataError,
     build_package_zip,
     deploy_plan,
@@ -739,6 +740,15 @@ async def deploy_approved_plan(
 
     connector = salesforce_from_connection(conn)
 
+    # Ground the package to the TARGET org's real API version so a stale or
+    # inconsistent LLM-authored apiVersion in Apex/LWC meta files never fails the
+    # deploy. Falls back to the deployer default if the org can't be queried.
+    try:
+        org_api_version = await asyncio.to_thread(connector.get_api_version)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not fetch org API version before deploy: %s", exc)
+        org_api_version = DEFAULT_API_VERSION
+
     # Safety net: ensure every declared layout_edit is resolved into a complete
     # layout file against the REAL layout in the TARGET org. This guarantees a
     # correct deploy even if the stored context lacked existing_layouts (e.g. an
@@ -768,7 +778,7 @@ async def deploy_approved_plan(
 
     # Fail fast with a clear message if there's nothing to deploy.
     try:
-        build_package_zip(plan_schema)
+        build_package_zip(plan_schema, api_version=org_api_version)
     except NoDeployableMetadataError as exc:
         raise HTTPException(
             status_code=422,
@@ -795,6 +805,7 @@ async def deploy_approved_plan(
             plan_schema,
             is_sandbox=connector.is_sandbox,
             check_only=payload.check_only,
+            api_version=org_api_version,
         )
 
     try:

@@ -264,6 +264,7 @@ function OrgContextPanel({
 
   const hasAnything =
     ctx.sf_org_edition ||
+    ctx.sf_api_version ||
     list(ctx.lsc_modules).length ||
     list(ctx.installed_packages).length ||
     metaSections.some((s) => s.items.length);
@@ -291,6 +292,11 @@ function OrgContextPanel({
         {ctx.sf_org_edition && (
           <Descriptions.Item label="Edition">
             {ctx.sf_org_edition}
+          </Descriptions.Item>
+        )}
+        {ctx.sf_api_version && (
+          <Descriptions.Item label="API version">
+            {ctx.sf_api_version}
           </Descriptions.Item>
         )}
         {list(ctx.lsc_modules).length > 0 && (
