@@ -188,6 +188,63 @@ def test_duplicate_object_member_is_deduped(valid_plan_dict):
     assert merged.count("<fullName>Foo__c</fullName>") == 1
 
 
+def _weblink_object(open_type: str, with_position: bool) -> str:
+    pos = "    <position>topLeft</position>\n" if with_position else ""
+    return _object_file(
+        "  <webLinks>\n"
+        "    <fullName>Open_Portal</fullName>\n"
+        f"    <openType>{open_type}</openType>\n"
+        f"{pos}"
+        "    <linkType>url</linkType>\n"
+        "    <masterLabel>Open Portal</masterLabel>\n"
+        "    <url>https://example.com</url>\n"
+        "  </webLinks>"
+    )
+
+
+@pytest.mark.parametrize("open_type", ["replace", "onClickJavaScript"])
+def test_weblink_position_stripped_for_forbidden_open_types(
+    valid_plan_dict, open_type
+):
+    """A WebLink with openType replace/onClickJavaScript must have <position>
+    removed at build time — Salesforce rejects the combination."""
+    data = copy.deepcopy(valid_plan_dict)
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {
+                "path": "objects/Account.object",
+                "body": _weblink_object(open_type, with_position=True),
+            }
+        ],
+        "members": [{"type": "WebLink", "name": "Account.Open_Portal"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["objects/Account.object"]
+    assert "<position>" not in built
+    # The rest of the WebLink is preserved.
+    assert "Open_Portal" in built
+    assert f"<openType>{open_type}</openType>" in built
+
+
+def test_weblink_position_kept_for_new_window(valid_plan_dict):
+    """A WebLink that opens a standalone window may keep its <position>."""
+    data = copy.deepcopy(valid_plan_dict)
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {
+                "path": "objects/Account.object",
+                "body": _weblink_object("newWindow", with_position=True),
+            }
+        ],
+        "members": [{"type": "WebLink", "name": "Account.Open_Portal"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["objects/Account.object"]
+    assert "<position>topLeft</position>" in built
+
+
 def test_conflicting_non_mergeable_file_still_raises(valid_plan_dict):
     """Two steps emitting different bodies for a non-aggregate file (e.g. Apex)
     is a real conflict and must still be rejected."""

@@ -148,6 +148,46 @@ def _normalize_api_version_in_body(body: str, api_version: str) -> str:
     )
 
 
+def _sanitize_weblink_positions(body: str) -> str:
+    """Drop ``<position>`` from WebLinks whose openType forbids it.
+
+    Salesforce rejects a WebLink that specifies a field position when its
+    ``openType`` is ``replace`` or ``onClickJavaScript`` with
+    *"Field Position must not be specified for web links if the open type is
+    Replace or On Click JavaScript"*. The LLM regularly emits a default
+    ``<position>`` regardless of openType, driving the fix-with-AI loop. This
+    strips the offending element at build time so the deploy is deterministic.
+
+    Operates on CustomObject bodies (WebLinks live inside ``objects/*.object``).
+    Returns the body unchanged if it does not parse or has no such WebLinks.
+    """
+    if "webLinks" not in body or "position" not in body:
+        return body
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body
+
+    ns = f"{{{_MDAPI_NS}}}"
+    changed = False
+    for wl in root.findall(f"{ns}webLinks") + root.findall("webLinks"):
+        open_el = wl.find(f"{ns}openType")
+        if open_el is None:
+            open_el = wl.find("openType")
+        open_type = (open_el.text or "").strip().lower() if open_el is not None else ""
+        if open_type not in ("replace", "onclickjavascript"):
+            continue
+        for pos in wl.findall(f"{ns}position") + wl.findall("position"):
+            wl.remove(pos)
+            changed = True
+
+    if not changed:
+        return body
+    ET.register_namespace("", _MDAPI_NS)
+    xml = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
 def _resolve_api_version(plan: Plan, api_version: str) -> str:
     """Pick the API version for the package.
 
@@ -218,6 +258,10 @@ def build_package_zip(
             # inconsistent LLM-authored apiVersion never fails the deploy.
             if _is_meta_file(path):
                 body = _normalize_api_version_in_body(body, resolved_version)
+            # Strip WebLink <position> when openType is replace/onClickJavaScript,
+            # which Salesforce rejects. Object files carry WebLinks inline.
+            if _is_mergeable(path):
+                body = _sanitize_weblink_positions(body)
             if path in file_map and file_map[path] != body:
                 # Aggregate metadata (e.g. a CustomObject holding both a new
                 # field and a new validation rule from different steps) must be

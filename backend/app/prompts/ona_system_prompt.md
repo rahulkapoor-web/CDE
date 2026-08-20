@@ -147,6 +147,24 @@ Key differences in MDAPI format:
    ```
    member: `{ "type": "CustomField", "name": "Account.Preferred_Pharmacy__c" }`
 
+   Custom button / link (WebLink) — lives INSIDE the object file `objects/<Object>.object` as a `<webLinks>` child; the member is `WebLink` / `<Object>.<LinkName>`. The valid child elements and their allowed combinations are fixed by the schema — a wrong combination fails with errors like *"Field Position must not be specified for web links if the open type is Replace or On Click JavaScript"*:
+   ```xml
+   <webLinks>
+       <fullName>Open_Portal</fullName>
+       <availability>online</availability>
+       <displayType>link</displayType>
+       <linkType>url</linkType>
+       <openType>newWindow</openType>
+       <masterLabel>Open Portal</masterLabel>
+       <protected>false</protected>
+       <url>https://portal.example.com/{!Account.Id}</url>
+   </webLinks>
+   ```
+   - `<position>` (values `fullScreen`/`none`/`topLeft`…) is ONLY valid when `<openType>` opens a standalone window — i.e. `newWindow` or `sidebar`. **Do NOT emit `<position>` when `<openType>` is `replace` or `onClickJavaScript`** (that is the exact cause of the "Field Position must not be specified" error); simply omit the element.
+   - For a JavaScript button use `<openType>onClickJavaScript</openType>` with `<linkType>javascript</linkType>` and NO `<position>`. For `<openType>replace</openType>` (open in existing window) also omit `<position>`.
+   - `<requireRowSelection>` applies only to list buttons; omit it for detail-page links.
+   member: `{ "type": "WebLink", "name": "Account.Open_Portal" }`
+
    Permission set granting field access — file path `permissionsets/PSL_Care_Coordinator.permissionset`:
    ```xml
    <?xml version="1.0" encoding="UTF-8"?>
@@ -243,6 +261,12 @@ Key differences in MDAPI format:
    - `RecordPage` → `flexipage:recordHomeTemplateDesktop` (header + main + sidebar) — this is the safe default for record pages.
    - `AppPage` / `HomePage` → `flexipage:defaultAppHomeTemplate` (or `flexipage:defaultHomeTemplate` for HomePage).
    When unsure, prefer `flexipage:recordHomeTemplateDesktop` with a single `main` region. `slds*` names are CSS grid classes, NOT FlexiPage templates — never use them as a `<template><name>` or `componentName`.
+
+   Flow — ONE file `flows/My_Flow.flow`. The root element is `<Flow>`; set `<apiVersion>` to the **Org API Version**, a `<label>`, a `<status>` (`Active` or `Draft`), and a `<processType>` (`Flow` for screen flows, `AutoLaunchedFlow` for record-triggered/autolaunched). Flow elements are strongly typed and each name/enum below is fixed by the Flow schema — an invalid enum fails with errors like *"'x' is not a valid value for the enum 'InvocableActionType'"*.
+   - **Navigation is NOT an action.** There is no `navigateToUrl` action and `navigateToUrl` is NOT a valid `InvocableActionType`. To open a URL from a screen flow, do NOT emit an `<actionCalls>`. Instead either (a) put the link in a screen `<fields>` display-text component using a hyperlink, or (b) set the flow's finish behavior / a `<screens>` element and let the containing component navigate. Only real, platform-registered invocable actions belong in `<actionCalls>` with an `<actionType>` — common valid `actionType` values include `emailSimple`, `emailAlert`, `submit`, `apex` (with `<actionName>` = the `@InvocableMethod` class), `chatterPost`, `flow` (subflow), and standard Salesforce invocable actions. If you are not certain an `actionType`/`actionName` pair is a real registered action, do NOT emit the `<actionCalls>` — model the behavior with assignments, decisions, record CRUD elements (`<recordCreates>`, `<recordUpdates>`, `<recordLookups>`, `<recordDeletes>`), or screens instead.
+   - Reference only objects/fields that exist in the Org Metadata Snapshot or are created by an earlier step in this plan; a flow referencing a missing field fails to deploy.
+   - Every connected element must be reachable from `<startElementReference>` (or the record-trigger `<start>`), and element `<name>`s referenced by connectors must exist. Do NOT emit orphan or dangling connector targets.
+   member: `{ "type": "Flow", "name": "My_Flow" }` (the member/file name is the flow's unique developer name/version-independent name).
 
 2. **Setup changes the story explicitly asks for that are not expressible in the Metadata API** (a Setup toggle with no metadata type that the ticket requires you to change). Set `metadata_artifact` to null, set `automation_feasibility` to `Manual` or `Partial`, and reference the relevant configuration guide in `lsc_guide_reference`. The developer performs these by hand following `description`. Do NOT create such a step for module/license/feature enablement that the story merely depends on — that is an `assumed_prerequisite` (see SCOPE DISCIPLINE), not a step.
 
