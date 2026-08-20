@@ -207,6 +207,38 @@ Key differences in MDAPI format:
    ```
    member: `{ "type": "LightningComponentBundle", "name": "myComponent" }` (ONE member for the whole bundle, name = folder name, not the file names). The folder name, the file base names, and the member name MUST all match exactly (camelCase). Any `@salesforce/schema/Object.Field` import in the JS MUST reference a field that exists in the Org Metadata Snapshot; if the story needs a new field, add an earlier step that creates it and make the LWC step depend on it.
 
+   Lightning page (FlexiPage) — ONE file `flexipages/My_Record_Page.flexipage-meta.xml`. The element hierarchy is fixed by the FlexiPage schema; using the wrong element name fails with errors like *"Property 'componentInstances' not valid in version X"*. The ONLY valid structure is `flexiPageRegions` → `itemInstances` → `componentInstance` (each singular). There is NO `componentInstances` element:
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <FlexiPage xmlns="http://soap.sforce.com/2006/04/metadata">
+       <flexiPageRegions>
+           <name>main</name>
+           <type>Region</type>
+           <itemInstances>
+               <componentInstance>
+                   <componentName>flexipage:recordDetail</componentName>
+               </componentInstance>
+           </itemInstances>
+           <itemInstances>
+               <componentInstance>
+                   <componentName>c:myComponent</componentName>
+                   <componentInstanceProperties>
+                       <name>recordId</name>
+                       <value>{!recordId}</value>
+                   </componentInstanceProperties>
+               </componentInstance>
+           </itemInstances>
+       </flexiPageRegions>
+       <masterLabel>My Record Page</masterLabel>
+       <sobjectType>Account</sobjectType>
+       <template>
+           <name>flexipage:recordHomeTemplateDesktop</name>
+       </template>
+       <type>RecordPage</type>
+   </FlexiPage>
+   ```
+   member: `{ "type": "FlexiPage", "name": "My_Record_Page" }` (the member/file name is the FlexiPage developer name, not the masterLabel). Element rules: each `itemInstances` wraps exactly ONE `componentInstance` (or `fieldInstance` for a field, or `blankSpace`); a field is `<fieldInstance><fieldItem>Record.FieldApiName</fieldItem></fieldInstance>`; custom LWC/Aura are referenced as `c:componentName`; standard components as `flexipage:...` or `force:...`. Any `c:` component or field referenced here MUST exist in the org or be created by an earlier step in this plan.
+
 2. **Setup changes the story explicitly asks for that are not expressible in the Metadata API** (a Setup toggle with no metadata type that the ticket requires you to change). Set `metadata_artifact` to null, set `automation_feasibility` to `Manual` or `Partial`, and reference the relevant configuration guide in `lsc_guide_reference`. The developer performs these by hand following `description`. Do NOT create such a step for module/license/feature enablement that the story merely depends on — that is an `assumed_prerequisite` (see SCOPE DISCIPLINE), not a step.
 
 3. **Test steps** (`type` = "Test") are verification actions; set `metadata_artifact` to null unless the step deploys Apex test classes.
@@ -217,6 +249,7 @@ Consistency rules:
 - Keep paths POSIX (forward slashes). Use MDAPI extensions (no `-meta.xml` except for Apex/LWC).
 - **Multi-file components deploy atomically — keep each in ONE step.** An LWC bundle (html+js+js-meta.xml) or an Apex class (cls+cls-meta.xml) must be emitted together in a single step, not spread across steps; a package containing only part of a bundle is rejected.
 - **A FlexiPage or component that references another component/field can only deploy if that dependency is in the SAME package or already in the org.** If a step emits a FlexiPage that embeds an LWC, emit the LWC in the same plan (an earlier step) and add a dependency; never reference a component that does not exist in the org and is not created by this plan.
+- **Use exact, version-valid element names for every metadata type.** A wrong or misspelled/pluralized element fails with *"Property '<x>' not valid in version N"*. Never invent element names or guess singular/plural. Known pitfalls: FlexiPage uses `flexiPageRegions` → `itemInstances` → `componentInstance` (there is NO `componentInstances`); a FlexiPage component property is `componentInstanceProperties`; a FlexiPage field is `fieldInstance`/`fieldItem`. If you are not certain an element exists in the target API version, do not emit it. When a deploy error reports an invalid property, the fix is to correct the element name to the schema-valid one, not to change the apiVersion.
 - **Page layouts MUST be automated via `layout_edits`, never hand-written XML and never manual.** The `Layout` type is fully deployable, but a Layout deploy REPLACES the entire layout, so any hand-written XML that omits a required item (e.g. `Name`) fails with *"Layout must contain an item for required layout field: Name"*. When the story requires a field on a layout:
   - Declare the change on the step's `layout_edits` array (`layout_name`, `add_fields` with `field`/`section`/`behavior`). The backend loads the org's real layout XML (from the EXISTING PAGE LAYOUTS input), inserts your fields into the named section, preserves every existing/required item, and emits the complete `.layout` file plus its package member automatically. Set `automation_feasibility` = `Full`.
   - Do NOT emit a `Layout` file in `metadata_artifact.files` or a `Layout` member yourself. Do NOT reproduce full layout XML.

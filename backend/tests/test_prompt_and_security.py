@@ -14,6 +14,19 @@ def test_system_prompt_loads():
     assert "OUTPUT FORMAT" in text
 
 
+def test_system_prompt_has_correct_flexipage_schema():
+    """The prompt must teach the valid FlexiPage element hierarchy so the model
+    stops emitting invalid elements like `componentInstances` (plural), which
+    fail with "Property 'componentInstances' not valid in version N"."""
+    text = load_system_prompt()
+    # The valid singular element is documented...
+    assert "componentInstance" in text
+    assert "flexiPageRegions" in text
+    assert "itemInstances" in text
+    # ...and the invalid plural is explicitly called out as wrong.
+    assert "NO `componentInstances`" in text or "no `componentInstances`" in text
+
+
 def test_user_prompt_injects_context():
     ctx = PlanningContext(
         jira_ticket_id="LSC-42",
