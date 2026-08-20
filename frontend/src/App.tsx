@@ -1,7 +1,15 @@
-import { Layout, Menu } from "antd";
+import { Avatar, Dropdown, Layout, Menu } from "antd";
+import {
+  ApiOutlined,
+  LogoutOutlined,
+  ThunderboltOutlined,
+  UnorderedListOutlined,
+  UserOutlined,
+} from "@ant-design/icons";
 import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import type { ReactNode } from "react";
 import { useAuth } from "./hooks/useAuth";
+import Logo from "./components/Logo";
 import LoginPage from "./pages/LoginPage";
 import ConnectionsPage from "./pages/ConnectionsPage";
 import GeneratePage from "./pages/GeneratePage";
@@ -27,25 +35,76 @@ export default function App() {
   return (
     <Layout style={{ minHeight: "100vh" }}>
       {user && (
-        <Header style={{ display: "flex", alignItems: "center" }}>
-          <div style={{ color: "#fff", fontWeight: 600, marginRight: 32 }}>
-            ONA Planning Engine
+        <Header
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 32,
+            paddingInline: 24,
+            background: "#0b1220",
+            position: "sticky",
+            top: 0,
+            zIndex: 10,
+            boxShadow: "0 1px 0 rgba(255,255,255,0.06)",
+          }}
+        >
+          <div
+            style={{ cursor: "pointer", flexShrink: 0 }}
+            onClick={() => navigate("/generate")}
+          >
+            <Logo size={34} />
           </div>
           <Menu
             theme="dark"
             mode="horizontal"
             selectedKeys={[selectedKey]}
-            style={{ flex: 1, minWidth: 0 }}
+            style={{ flex: 1, minWidth: 0, background: "transparent" }}
             onClick={({ key }) => navigate(key)}
             items={[
-              { key: "/generate", label: "Generate" },
-              { key: "/plans", label: "Plans" },
-              { key: "/connections", label: "Connections" },
+              {
+                key: "/generate",
+                label: "Generate",
+                icon: <ThunderboltOutlined />,
+              },
+              { key: "/plans", label: "Plans", icon: <UnorderedListOutlined /> },
+              {
+                key: "/connections",
+                label: "Connections",
+                icon: <ApiOutlined />,
+              },
             ]}
           />
-          <a style={{ color: "#fff" }} onClick={() => { logout(); navigate("/login"); }}>
-            Logout ({user.email})
-          </a>
+          <Dropdown
+            placement="bottomRight"
+            menu={{
+              items: [
+                {
+                  key: "email",
+                  label: user.email,
+                  disabled: true,
+                },
+                { type: "divider" },
+                {
+                  key: "logout",
+                  label: "Log out",
+                  icon: <LogoutOutlined />,
+                  onClick: () => {
+                    logout();
+                    navigate("/login");
+                  },
+                },
+              ],
+            }}
+          >
+            <Avatar
+              style={{
+                backgroundColor: "#1677ff",
+                cursor: "pointer",
+                flexShrink: 0,
+              }}
+              icon={<UserOutlined />}
+            />
+          </Dropdown>
         </Header>
       )}
       <Content style={{ padding: user ? 24 : 0 }}>
