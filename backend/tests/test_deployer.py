@@ -362,6 +362,107 @@ def test_flow_existing_start_is_preserved(valid_plan_dict):
     assert len(root.findall(f"{ns}start")) == 1
 
 
+def test_custom_tab_sobject_name_is_stripped(valid_plan_dict):
+    """A custom-object CustomTab must not carry <sobjectName> — it fails with
+    'Element sobjectName invalid at this location in type CustomTab'."""
+    data = copy.deepcopy(valid_plan_dict)
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<CustomTab xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "    <customObject>true</customObject>\n"
+        "    <motif>Custom77: Document</motif>\n"
+        "    <sobjectName>Received_Document__c</sobjectName>\n"
+        "</CustomTab>\n"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "tabs/Received_Document__c.tab", "body": body}],
+        "members": [{"type": "CustomTab", "name": "Received_Document__c"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["tabs/Received_Document__c.tab"]
+    assert "<sobjectName>" not in built
+    assert "<customObject>true</customObject>" in built
+
+
+def test_flexipage_component_identifier_is_injected(valid_plan_dict):
+    """Every FlexiPage <componentInstance> must have an <identifier> as its
+    first child, else deploy fails with 'doesn't have an identifier specified'.
+    """
+    data = copy.deepcopy(valid_plan_dict)
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<FlexiPage xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "    <flexiPageRegions>\n"
+        "        <name>main</name>\n"
+        "        <type>Region</type>\n"
+        "        <itemInstances>\n"
+        "            <componentInstance>\n"
+        "                <componentName>c:documentSplitClassify</componentName>\n"
+        "            </componentInstance>\n"
+        "        </itemInstances>\n"
+        "    </flexiPageRegions>\n"
+        "    <masterLabel>Document Processor</masterLabel>\n"
+        "    <template><name>flexipage:defaultAppHomeTemplate</name></template>\n"
+        "    <type>AppPage</type>\n"
+        "</FlexiPage>\n"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {"path": "flexipages/Document_Processor.flexipage-meta.xml", "body": body}
+        ],
+        "members": [{"type": "FlexiPage", "name": "Document_Processor"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))[
+        "flexipages/Document_Processor.flexipage-meta.xml"
+    ]
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://soap.sforce.com/2006/04/metadata}"
+    root = ET.fromstring(built)
+    ci = next(root.iter(f"{ns}componentInstance"))
+    ident = ci.find(f"{ns}identifier")
+    assert ident is not None and ident.text
+    # identifier must be the first child (schema order).
+    assert list(ci)[0].tag.endswith("identifier")
+
+
+def test_flexipage_existing_identifier_is_preserved(valid_plan_dict):
+    """A componentInstance that already has an <identifier> is left as-is."""
+    data = copy.deepcopy(valid_plan_dict)
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<FlexiPage xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "    <flexiPageRegions>\n"
+        "        <name>main</name>\n"
+        "        <type>Region</type>\n"
+        "        <itemInstances>\n"
+        "            <componentInstance>\n"
+        "                <identifier>myCustomId</identifier>\n"
+        "                <componentName>c:foo</componentName>\n"
+        "            </componentInstance>\n"
+        "        </itemInstances>\n"
+        "    </flexiPageRegions>\n"
+        "    <masterLabel>P</masterLabel>\n"
+        "    <template><name>flexipage:defaultAppHomeTemplate</name></template>\n"
+        "    <type>AppPage</type>\n"
+        "</FlexiPage>\n"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {"path": "flexipages/P.flexipage-meta.xml", "body": body}
+        ],
+        "members": [{"type": "FlexiPage", "name": "P"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["flexipages/P.flexipage-meta.xml"]
+    assert built.count("<identifier>") == 1
+    assert "<identifier>myCustomId</identifier>" in built
+
+
 def test_conflicting_non_mergeable_file_still_raises(valid_plan_dict):
     """Two steps emitting different bodies for a non-aggregate file (e.g. Apex)
     is a real conflict and must still be rejected."""

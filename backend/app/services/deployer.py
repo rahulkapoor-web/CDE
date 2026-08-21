@@ -296,6 +296,94 @@ def _reorder_flow_elements(body: str) -> str:
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
 
 
+def _sanitize_custom_tab(body: str) -> str:
+    """Remove the invalid ``<sobjectName>`` from a custom-object CustomTab.
+
+    A tab for a custom object is declared with ``<customObject>true</...>``; the
+    object it belongs to is taken from the tab's fullName (the file/member name),
+    NOT from an ``<sobjectName>`` element — which does not exist on CustomTab and
+    fails with *"Element sobjectName invalid at this location in type
+    CustomTab"*. The LLM adds it anyway; strip it so the tab deploys (and so a
+    permission set's tabSettings reference to it resolves).
+
+    Returns the body unchanged if it does not parse or has no such element.
+    """
+    if "sobjectName" not in body:
+        return body
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body
+    if root.tag.split("}")[-1] != "CustomTab":
+        return body
+
+    ns = f"{{{_MDAPI_NS}}}"
+    removed = False
+    for el in root.findall(f"{ns}sobjectName") + root.findall("sobjectName"):
+        root.remove(el)
+        removed = True
+    if not removed:
+        return body
+    ET.register_namespace("", _MDAPI_NS)
+    xml = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
+def _sanitize_flexipage_identifiers(body: str) -> str:
+    """Ensure every FlexiPage ``<componentInstance>`` has an ``<identifier>``.
+
+    Each component placed on a Lightning page needs a unique ``<identifier>``;
+    without it the deploy fails with *"The 'c:foo' component instance doesn't
+    have an identifier specified."*. The LLM routinely omits it. This injects a
+    deterministic unique identifier derived from the component name so the page
+    deploys.
+
+    Returns the body unchanged if it does not parse or is not a FlexiPage.
+    """
+    if "componentInstance" not in body:
+        return body
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body
+    if root.tag.split("}")[-1] != "FlexiPage":
+        return body
+
+    ns = f"{{{_MDAPI_NS}}}"
+    changed = False
+    seen: set[str] = set()
+    for i, ci in enumerate(root.iter(f"{ns}componentInstance")):
+        existing = ci.find(f"{ns}identifier")
+        if existing is None:
+            existing = ci.find("identifier")
+        if existing is not None and existing.text and existing.text.strip():
+            seen.add(existing.text.strip())
+            continue
+        name_el = ci.find(f"{ns}componentName")
+        if name_el is None:
+            name_el = ci.find("componentName")
+        base = (name_el.text or "component").strip() if name_el is not None else "component"
+        # Derive a valid identifier: strip namespace, keep alnum, ensure unique.
+        stem = "".join(c for c in base.split(":")[-1] if c.isalnum()) or "component"
+        ident = f"{stem}{i}"
+        while ident in seen:
+            i += 1
+            ident = f"{stem}{i}"
+        seen.add(ident)
+        # componentInstance requires identifier to precede componentName in the
+        # schema; insert it as the first child.
+        id_el = ET.Element(f"{ns}identifier")
+        id_el.text = ident
+        ci.insert(0, id_el)
+        changed = True
+
+    if not changed:
+        return body
+    ET.register_namespace("", _MDAPI_NS)
+    xml = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
 def _resolve_api_version(plan: Plan, api_version: str) -> str:
     """Pick the API version for the package.
 
@@ -368,12 +456,19 @@ def build_package_zip(
                 body = _normalize_api_version_in_body(body, resolved_version)
             # Correct WebLinks (drop illegal <position>, inject required
             # <encodingKey>) inside object files, which carry WebLinks inline.
+            lpath = path.lower()
             if _is_mergeable(path):
                 body = _sanitize_object_weblinks(body)
             # Reorder Flow child elements so interleaved collections (a common
             # LLM mistake) don't fail with "Element X is duplicated".
-            elif path.lower().endswith((".flow", ".flow-meta.xml")):
+            elif lpath.endswith((".flow", ".flow-meta.xml")):
                 body = _reorder_flow_elements(body)
+            # Strip the invalid <sobjectName> from a custom-object CustomTab.
+            elif lpath.endswith((".tab", ".tab-meta.xml")):
+                body = _sanitize_custom_tab(body)
+            # Inject required <identifier> on FlexiPage component instances.
+            elif lpath.endswith((".flexipage", ".flexipage-meta.xml")):
+                body = _sanitize_flexipage_identifiers(body)
             if path in file_map and file_map[path] != body:
                 # Aggregate metadata (e.g. a CustomObject holding both a new
                 # field and a new validation rule from different steps) must be

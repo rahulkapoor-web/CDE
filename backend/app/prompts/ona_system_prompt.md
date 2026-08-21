@@ -236,11 +236,13 @@ Key differences in MDAPI format:
            <type>Region</type>
            <itemInstances>
                <componentInstance>
+                   <identifier>recordDetail1</identifier>
                    <componentName>flexipage:recordDetail</componentName>
                </componentInstance>
            </itemInstances>
            <itemInstances>
                <componentInstance>
+                   <identifier>myComponent1</identifier>
                    <componentName>c:myComponent</componentName>
                    <componentInstanceProperties>
                        <name>recordId</name>
@@ -257,12 +259,22 @@ Key differences in MDAPI format:
        <type>RecordPage</type>
    </FlexiPage>
    ```
-   member: `{ "type": "FlexiPage", "name": "My_Record_Page" }` (the member/file name is the FlexiPage developer name, not the masterLabel). Element rules: each `itemInstances` wraps exactly ONE `componentInstance` (or `fieldInstance` for a field, or `blankSpace`); a field is `<fieldInstance><fieldItem>Record.FieldApiName</fieldItem></fieldInstance>`; custom LWC/Aura are referenced as `c:componentName`; standard components as `flexipage:...` or `force:...`. Any `c:` component or field referenced here MUST exist in the org or be created by an earlier step in this plan.
+   member: `{ "type": "FlexiPage", "name": "My_Record_Page" }` (the member/file name is the FlexiPage developer name, not the masterLabel). Element rules: each `itemInstances` wraps exactly ONE `componentInstance` (or `fieldInstance` for a field, or `blankSpace`); a field is `<fieldInstance><fieldItem>Record.FieldApiName</fieldItem></fieldInstance>`; custom LWC/Aura are referenced as `c:componentName`; standard components as `flexipage:...` or `force:...`. Any `c:` component or field referenced here MUST exist in the org or be created by an earlier step in this plan. **Every `<componentInstance>` MUST have a unique `<identifier>` as its FIRST child** (e.g. `<identifier>myComponent1</identifier>`) — omitting it fails with *"The 'c:foo' component instance doesn't have an identifier specified."*.
 
    **`<template><name>` MUST be a real, Salesforce-provided template name.** Do NOT invent template names — names like `flexipage:sldsFlexibleLayout1Column` do NOT exist and fail with *"Template flexipage:… doesn't exist"*. Use the correct template for the page `<type>`, and make the number of `<flexiPageRegions>` match the template's column/region count:
    - `RecordPage` → `flexipage:recordHomeTemplateDesktop` (header + main + sidebar) — this is the safe default for record pages.
    - `AppPage` / `HomePage` → `flexipage:defaultAppHomeTemplate` (or `flexipage:defaultHomeTemplate` for HomePage).
    When unsure, prefer `flexipage:recordHomeTemplateDesktop` with a single `main` region. `slds*` names are CSS grid classes, NOT FlexiPage templates — never use them as a `<template><name>` or `componentName`.
+
+   Custom tab (CustomTab) — ONE file `tabs/<Object>__c.tab`. For a custom-object tab the ONLY object linkage is `<customObject>true</customObject>`; the object is taken from the tab's fullName (the member/file name), so it MUST match the object's API name exactly. **Do NOT emit an `<sobjectName>` element — it does not exist on CustomTab and fails with *"Element sobjectName invalid at this location in type CustomTab"*.** A permission set that grants tab visibility references this same name in `<tabSettings><tab>`; if the tab fails to deploy, the permset fails too with *"no CustomTab named X found"*, so a correct tab fixes both:
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <CustomTab xmlns="http://soap.sforce.com/2006/04/metadata">
+       <customObject>true</customObject>
+       <motif>Custom77: Document</motif>
+   </CustomTab>
+   ```
+   member: `{ "type": "CustomTab", "name": "Received_Document__c" }` (name = the object API name; the file is `tabs/Received_Document__c.tab`).
 
    Flow — ONE file `flows/My_Flow.flow`. The root element is `<Flow>`; set `<apiVersion>` to the **Org API Version**, a `<label>`, a `<status>` (`Active` or `Draft`), and a `<processType>` (`Flow` for screen flows, `AutoLaunchedFlow` for record-triggered/autolaunched). Flow elements are strongly typed and each name/enum below is fixed by the Flow schema — an invalid enum fails with errors like *"'x' is not a valid value for the enum 'InvocableActionType'"*.
    - **Navigation is NOT an action.** There is no `navigateToUrl` action and `navigateToUrl` is NOT a valid `InvocableActionType`. To open a URL from a screen flow, do NOT emit an `<actionCalls>`. Instead either (a) put the link in a screen `<fields>` display-text component using a hyperlink, or (b) set the flow's finish behavior / a `<screens>` element and let the containing component navigate. Only real, platform-registered invocable actions belong in `<actionCalls>` with an `<actionType>` — common valid `actionType` values include `emailSimple`, `emailAlert`, `submit`, `apex` (with `<actionName>` = the `@InvocableMethod` class), `chatterPost`, `flow` (subflow), and standard Salesforce invocable actions. If you are not certain an `actionType`/`actionName` pair is a real registered action, do NOT emit the `<actionCalls>` — model the behavior with assignments, decisions, record CRUD elements (`<recordCreates>`, `<recordUpdates>`, `<recordLookups>`, `<recordDeletes>`), or screens instead.
