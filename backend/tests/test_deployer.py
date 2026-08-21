@@ -306,6 +306,62 @@ def test_flow_interleaved_screens_are_grouped(valid_plan_dict):
     assert "ScreenA" in built and "ScreenB" in built and "CreateRec" in built
 
 
+def test_flow_legacy_start_reference_upgraded_to_start(valid_plan_dict):
+    """A legacy <startElementReference> is rewritten to a modern <start> with
+    coordinates and a connector, avoiding 'Required field is missing: locationX'.
+    """
+    data = copy.deepcopy(valid_plan_dict)
+    body = _flow_body(
+        "    <startElementReference>BasicInfo</startElementReference>\n"
+        "    <screens><name>BasicInfo</name>"
+        "<locationX>176</locationX><locationY>134</locationY></screens>"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "flows/New_Account_Intake.flow", "body": body}],
+        "members": [{"type": "Flow", "name": "New_Account_Intake"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["flows/New_Account_Intake.flow"]
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://soap.sforce.com/2006/04/metadata}"
+    root = ET.fromstring(built)
+    start = root.find(f"{ns}start")
+    assert start is not None
+    assert start.findtext(f"{ns}locationX") is not None
+    assert start.findtext(f"{ns}locationY") is not None
+    conn = start.find(f"{ns}connector")
+    assert conn is not None
+    assert conn.findtext(f"{ns}targetReference") == "BasicInfo"
+    # Legacy pointer removed.
+    assert root.find(f"{ns}startElementReference") is None
+
+
+def test_flow_existing_start_is_preserved(valid_plan_dict):
+    """A flow that already uses a modern <start> is left untouched (no dup)."""
+    data = copy.deepcopy(valid_plan_dict)
+    body = _flow_body(
+        "    <start><locationX>50</locationX><locationY>0</locationY>"
+        "<connector><targetReference>BasicInfo</targetReference></connector>"
+        "</start>\n"
+        "    <screens><name>BasicInfo</name>"
+        "<locationX>176</locationX><locationY>134</locationY></screens>"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "flows/New_Account_Intake.flow", "body": body}],
+        "members": [{"type": "Flow", "name": "New_Account_Intake"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["flows/New_Account_Intake.flow"]
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://soap.sforce.com/2006/04/metadata}"
+    root = ET.fromstring(built)
+    assert len(root.findall(f"{ns}start")) == 1
+
+
 def test_conflicting_non_mergeable_file_still_raises(valid_plan_dict):
     """Two steps emitting different bodies for a non-aggregate file (e.g. Apex)
     is a real conflict and must still be rejected."""

@@ -218,16 +218,57 @@ def _sanitize_object_weblinks(body: str) -> str:
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
 
 
-def _reorder_flow_elements(body: str) -> str:
-    """Order a Flow's child elements alphabetically by tag.
+def _flow_find(parent: ET.Element, tag: str) -> ET.Element | None:
+    el = parent.find(f"{{{_MDAPI_NS}}}{tag}")
+    return el if el is not None else parent.find(tag)
 
-    Salesforce's Flow schema is an ``xsd:sequence``: element collections must be
-    grouped and appear in a fixed (alphabetical) order. When the LLM interleaves
-    them — e.g. ``screens`` … ``recordCreates`` … ``screens`` — the deploy fails
-    with *"Element screens is duplicated at this location in type Flow"*. Sorting
-    the direct children of ``<Flow>`` by local tag name reproduces exactly the
-    order Salesforce emits when a flow is retrieved, so the document becomes
-    schema-valid regardless of the order the model wrote.
+
+def _upgrade_flow_start(root: ET.Element) -> bool:
+    """Convert a legacy ``<startElementReference>`` into a modern ``<start>``.
+
+    Newer API versions require a ``<start>`` element that carries its own
+    ``<locationX>``/``<locationY>`` and a ``<connector>`` to the first element.
+    Older LLM-authored flows use ``<startElementReference>TargetName</...>``,
+    which deploys at those versions with *"Required field is missing: locationX"*
+    (the missing coordinate belongs to the absent ``<start>``). This rewrites the
+    legacy pointer into a proper ``<start>`` so the flow deploys.
+
+    Returns True if the document was modified.
+    """
+    ns = f"{{{_MDAPI_NS}}}"
+    # Already has a modern <start>: nothing to do.
+    if _flow_find(root, "start") is not None:
+        return False
+    ref = _flow_find(root, "startElementReference")
+    if ref is None or not (ref.text and ref.text.strip()):
+        return False
+    target = ref.text.strip()
+
+    root.remove(ref)
+    start = ET.SubElement(root, f"{ns}start")
+    lx = ET.SubElement(start, f"{ns}locationX")
+    lx.text = "50"
+    ly = ET.SubElement(start, f"{ns}locationY")
+    ly.text = "0"
+    conn = ET.SubElement(start, f"{ns}connector")
+    tgt = ET.SubElement(conn, f"{ns}targetReference")
+    tgt.text = target
+    return True
+
+
+def _reorder_flow_elements(body: str) -> str:
+    """Normalize a Flow so it deploys: modern ``<start>`` + ordered children.
+
+    Two deterministic, recurring LLM mistakes are corrected:
+
+    * A legacy ``<startElementReference>`` (no ``<start>``) fails on newer API
+      versions with *"Required field is missing: locationX"*. It is upgraded to a
+      ``<start>`` element with coordinates and a connector.
+    * Interleaved element collections — e.g. ``screens`` … ``recordCreates`` …
+      ``screens`` — fail with *"Element screens is duplicated at this location in
+      type Flow"*. The Flow schema is an ``xsd:sequence``; sorting the direct
+      children of ``<Flow>`` alphabetically by local tag reproduces the order
+      Salesforce emits on retrieval, so the document becomes schema-valid.
 
     Returns the body unchanged if it does not parse or is not a Flow.
     """
@@ -238,14 +279,18 @@ def _reorder_flow_elements(body: str) -> str:
     if root.tag.split("}")[-1] != "Flow":
         return body
 
+    changed = _upgrade_flow_start(root)
+
     kids = list(root)
     ordered = sorted(kids, key=lambda e: e.tag.split("}")[-1])
-    if ordered == kids:
-        return body
-    for k in kids:
-        root.remove(k)
-    root.extend(ordered)
+    if ordered != kids:
+        for k in kids:
+            root.remove(k)
+        root.extend(ordered)
+        changed = True
 
+    if not changed:
+        return body
     ET.register_namespace("", _MDAPI_NS)
     xml = ET.tostring(root, encoding="unicode")
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
