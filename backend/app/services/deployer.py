@@ -148,20 +148,33 @@ def _normalize_api_version_in_body(body: str, api_version: str) -> str:
     )
 
 
-def _sanitize_weblink_positions(body: str) -> str:
-    """Drop ``<position>`` from WebLinks whose openType forbids it.
+def _wl_find(wl: ET.Element, tag: str) -> ET.Element | None:
+    el = wl.find(f"{{{_MDAPI_NS}}}{tag}")
+    return el if el is not None else wl.find(tag)
 
-    Salesforce rejects a WebLink that specifies a field position when its
-    ``openType`` is ``replace`` or ``onClickJavaScript`` with
-    *"Field Position must not be specified for web links if the open type is
-    Replace or On Click JavaScript"*. The LLM regularly emits a default
-    ``<position>`` regardless of openType, driving the fix-with-AI loop. This
-    strips the offending element at build time so the deploy is deterministic.
 
-    Operates on CustomObject bodies (WebLinks live inside ``objects/*.object``).
-    Returns the body unchanged if it does not parse or has no such WebLinks.
+def _sanitize_object_weblinks(body: str) -> str:
+    """Correct WebLinks inside a CustomObject body so they deploy.
+
+    The LLM emits WebLinks (custom buttons/links) that fail deploy in two
+    recurring, mechanical ways; both are fixed deterministically here so they
+    never reach the org or drive the fix-with-AI loop:
+
+    * ``<position>`` is present when ``openType`` is ``replace`` or
+      ``onClickJavaScript`` — Salesforce rejects this with *"Field Position must
+      not be specified for web links if the open type is Replace or On Click
+      JavaScript"*. The element is stripped.
+    * A URL WebLink omits ``<encodingKey>`` — Salesforce rejects it with
+      *"encodingKey must be specified"*. A default ``UTF-8`` is injected.
+
+    Each WebLink's children are then ordered alphabetically by tag, matching how
+    Salesforce itself serializes retrieved metadata, so inserting elements never
+    produces an out-of-order document.
+
+    Operates on CustomObject bodies (``objects/*.object``). Returns the body
+    unchanged if it does not parse or contains no WebLinks.
     """
-    if "webLinks" not in body or "position" not in body:
+    if "webLinks" not in body:
         return body
     try:
         root = ET.fromstring(body)
@@ -171,18 +184,68 @@ def _sanitize_weblink_positions(body: str) -> str:
     ns = f"{{{_MDAPI_NS}}}"
     changed = False
     for wl in root.findall(f"{ns}webLinks") + root.findall("webLinks"):
-        open_el = wl.find(f"{ns}openType")
-        if open_el is None:
-            open_el = wl.find("openType")
+        open_el = _wl_find(wl, "openType")
         open_type = (open_el.text or "").strip().lower() if open_el is not None else ""
-        if open_type not in ("replace", "onclickjavascript"):
-            continue
-        for pos in wl.findall(f"{ns}position") + wl.findall("position"):
-            wl.remove(pos)
+        link_el = _wl_find(wl, "linkType")
+        link_type = (link_el.text or "").strip().lower() if link_el is not None else ""
+
+        # Drop <position> where the openType forbids it.
+        if open_type in ("replace", "onclickjavascript"):
+            for pos in wl.findall(f"{ns}position") + wl.findall("position"):
+                wl.remove(pos)
+                changed = True
+
+        # Ensure a URL WebLink has an encodingKey.
+        if link_type == "url" and _wl_find(wl, "encodingKey") is None:
+            ek = ET.SubElement(wl, f"{ns}encodingKey")
+            ek.text = "UTF-8"
+            changed = True
+
+        # Order children alphabetically (Salesforce's own retrieval order) so
+        # any inserted element sits in a schema-valid position.
+        kids = list(wl)
+        ordered = sorted(kids, key=lambda e: e.tag.split("}")[-1])
+        if ordered != kids:
+            for k in kids:
+                wl.remove(k)
+            wl.extend(ordered)
             changed = True
 
     if not changed:
         return body
+    ET.register_namespace("", _MDAPI_NS)
+    xml = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
+def _reorder_flow_elements(body: str) -> str:
+    """Order a Flow's child elements alphabetically by tag.
+
+    Salesforce's Flow schema is an ``xsd:sequence``: element collections must be
+    grouped and appear in a fixed (alphabetical) order. When the LLM interleaves
+    them — e.g. ``screens`` … ``recordCreates`` … ``screens`` — the deploy fails
+    with *"Element screens is duplicated at this location in type Flow"*. Sorting
+    the direct children of ``<Flow>`` by local tag name reproduces exactly the
+    order Salesforce emits when a flow is retrieved, so the document becomes
+    schema-valid regardless of the order the model wrote.
+
+    Returns the body unchanged if it does not parse or is not a Flow.
+    """
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body
+    if root.tag.split("}")[-1] != "Flow":
+        return body
+
+    kids = list(root)
+    ordered = sorted(kids, key=lambda e: e.tag.split("}")[-1])
+    if ordered == kids:
+        return body
+    for k in kids:
+        root.remove(k)
+    root.extend(ordered)
+
     ET.register_namespace("", _MDAPI_NS)
     xml = ET.tostring(root, encoding="unicode")
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
@@ -258,10 +321,14 @@ def build_package_zip(
             # inconsistent LLM-authored apiVersion never fails the deploy.
             if _is_meta_file(path):
                 body = _normalize_api_version_in_body(body, resolved_version)
-            # Strip WebLink <position> when openType is replace/onClickJavaScript,
-            # which Salesforce rejects. Object files carry WebLinks inline.
+            # Correct WebLinks (drop illegal <position>, inject required
+            # <encodingKey>) inside object files, which carry WebLinks inline.
             if _is_mergeable(path):
-                body = _sanitize_weblink_positions(body)
+                body = _sanitize_object_weblinks(body)
+            # Reorder Flow child elements so interleaved collections (a common
+            # LLM mistake) don't fail with "Element X is duplicated".
+            elif path.lower().endswith((".flow", ".flow-meta.xml")):
+                body = _reorder_flow_elements(body)
             if path in file_map and file_map[path] != body:
                 # Aggregate metadata (e.g. a CustomObject holding both a new
                 # field and a new validation rule from different steps) must be

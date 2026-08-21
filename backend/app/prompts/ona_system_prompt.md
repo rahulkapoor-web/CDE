@@ -155,11 +155,13 @@ Key differences in MDAPI format:
        <displayType>link</displayType>
        <linkType>url</linkType>
        <openType>newWindow</openType>
+       <encodingKey>UTF-8</encodingKey>
        <masterLabel>Open Portal</masterLabel>
        <protected>false</protected>
        <url>https://portal.example.com/{!Account.Id}</url>
    </webLinks>
    ```
+   - **`<encodingKey>` is REQUIRED for a URL WebLink** (`<linkType>url</linkType>`) — omitting it fails with *"encodingKey must be specified"*. Use `UTF-8` unless the story requires otherwise.
    - `<position>` (values `fullScreen`/`none`/`topLeft`…) is ONLY valid when `<openType>` opens a standalone window — i.e. `newWindow` or `sidebar`. **Do NOT emit `<position>` when `<openType>` is `replace` or `onClickJavaScript`** (that is the exact cause of the "Field Position must not be specified" error); simply omit the element.
    - For a JavaScript button use `<openType>onClickJavaScript</openType>` with `<linkType>javascript</linkType>` and NO `<position>`. For `<openType>replace</openType>` (open in existing window) also omit `<position>`.
    - `<requireRowSelection>` applies only to list buttons; omit it for detail-page links.
@@ -266,6 +268,7 @@ Key differences in MDAPI format:
    - **Navigation is NOT an action.** There is no `navigateToUrl` action and `navigateToUrl` is NOT a valid `InvocableActionType`. To open a URL from a screen flow, do NOT emit an `<actionCalls>`. Instead either (a) put the link in a screen `<fields>` display-text component using a hyperlink, or (b) set the flow's finish behavior / a `<screens>` element and let the containing component navigate. Only real, platform-registered invocable actions belong in `<actionCalls>` with an `<actionType>` — common valid `actionType` values include `emailSimple`, `emailAlert`, `submit`, `apex` (with `<actionName>` = the `@InvocableMethod` class), `chatterPost`, `flow` (subflow), and standard Salesforce invocable actions. If you are not certain an `actionType`/`actionName` pair is a real registered action, do NOT emit the `<actionCalls>` — model the behavior with assignments, decisions, record CRUD elements (`<recordCreates>`, `<recordUpdates>`, `<recordLookups>`, `<recordDeletes>`), or screens instead.
    - Reference only objects/fields that exist in the Org Metadata Snapshot or are created by an earlier step in this plan; a flow referencing a missing field fails to deploy.
    - Every connected element must be reachable from `<startElementReference>` (or the record-trigger `<start>`), and element `<name>`s referenced by connectors must exist. Do NOT emit orphan or dangling connector targets.
+   - **Group every element collection together and order them alphabetically by tag.** The Flow schema is a fixed sequence: all `<screens>` must be contiguous, all `<recordCreates>` contiguous, etc. Interleaving them (e.g. a `<screens>`, then a `<recordCreates>`, then another `<screens>`) fails with *"Element screens is duplicated at this location in type Flow"*. Emit all elements of one type consecutively, in the alphabetical tag order Salesforce uses (e.g. `actionCalls`, `assignments`, `choices`, `decisions`, `recordCreates`, `recordLookups`, `recordUpdates`, `screens`, `variables`).
    member: `{ "type": "Flow", "name": "My_Flow" }` (the member/file name is the flow's unique developer name/version-independent name).
 
 2. **Setup changes the story explicitly asks for that are not expressible in the Metadata API** (a Setup toggle with no metadata type that the ticket requires you to change). Set `metadata_artifact` to null, set `automation_feasibility` to `Manual` or `Partial`, and reference the relevant configuration guide in `lsc_guide_reference`. The developer performs these by hand following `description`. Do NOT create such a step for module/license/feature enablement that the story merely depends on — that is an `assumed_prerequisite` (see SCOPE DISCIPLINE), not a step.

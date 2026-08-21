@@ -245,6 +245,67 @@ def test_weblink_position_kept_for_new_window(valid_plan_dict):
     assert "<position>topLeft</position>" in built
 
 
+def test_weblink_missing_encoding_key_is_injected(valid_plan_dict):
+    """A URL WebLink without <encodingKey> gets a UTF-8 default at build time —
+    Salesforce rejects it otherwise with 'encodingKey must be specified'."""
+    data = copy.deepcopy(valid_plan_dict)
+    # _weblink_object emits a url linkType and no encodingKey.
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {
+                "path": "objects/Account.object",
+                "body": _weblink_object("replace", with_position=False),
+            }
+        ],
+        "members": [{"type": "WebLink", "name": "Account.Open_Portal"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["objects/Account.object"]
+    assert "<encodingKey>UTF-8</encodingKey>" in built
+
+
+def _flow_body(elements_xml: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "    <apiVersion>60.0</apiVersion>\n"
+        "    <label>My Flow</label>\n"
+        "    <processType>Flow</processType>\n"
+        "    <status>Active</status>\n"
+        f"{elements_xml}\n"
+        "</Flow>\n"
+    )
+
+
+def test_flow_interleaved_screens_are_grouped(valid_plan_dict):
+    """Interleaved <screens>/<recordCreates>/<screens> must be reordered so the
+    screens are contiguous, avoiding 'Element screens is duplicated'."""
+    data = copy.deepcopy(valid_plan_dict)
+    body = _flow_body(
+        "    <screens><name>ScreenA</name></screens>\n"
+        "    <recordCreates><name>CreateRec</name></recordCreates>\n"
+        "    <screens><name>ScreenB</name></screens>"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "flows/New_Account_Intake.flow", "body": body}],
+        "members": [{"type": "Flow", "name": "New_Account_Intake"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["flows/New_Account_Intake.flow"]
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://soap.sforce.com/2006/04/metadata}"
+    root = ET.fromstring(built)
+    tags = [c.tag.replace(ns, "") for c in root]
+    screen_idx = [i for i, t in enumerate(tags) if t == "screens"]
+    # Both screens survive and are now contiguous.
+    assert len(screen_idx) == 2
+    assert screen_idx == list(range(screen_idx[0], screen_idx[0] + 2))
+    assert "ScreenA" in built and "ScreenB" in built and "CreateRec" in built
+
+
 def test_conflicting_non_mergeable_file_still_raises(valid_plan_dict):
     """Two steps emitting different bodies for a non-aggregate file (e.g. Apex)
     is a real conflict and must still be rejected."""
