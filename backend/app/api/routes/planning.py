@@ -537,6 +537,7 @@ async def _run_refinement_background(
     user_id: int,
     feedback: str,
     prev_status: str,
+    images: list[ImageInput] | None = None,
 ) -> None:
     """Refine a plan in the background and update the record in place.
 
@@ -567,7 +568,7 @@ async def _run_refinement_background(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Guide retrieval failed: %s", exc)
             refined, refined_dict = await refine_plan(
-                provider, ctx, plan.plan_json, feedback, guide_context
+                provider, ctx, plan.plan_json, feedback, guide_context, images=images
             )
         except PlanGenerationError as exc:
             plan.status = prev_status
@@ -614,24 +615,24 @@ async def _run_refinement_background(
         await db.commit()
 
 
-@router.post("/plans/{plan_id}/refine", response_model=PlanOut)
-async def refine_existing_plan(
+async def _start_refinement(
+    db: AsyncSession,
+    user: User,
     plan_id: int,
-    payload: RefinePlanRequest,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    feedback: str,
+    images: list[ImageInput] | None = None,
 ) -> PlanOut:
-    """Human-in-the-loop refinement: revise the same plan from reviewer feedback.
+    """Validate, gate, and kick off a background refinement for a plan.
 
-    The AI regenerates a refined version of the current plan incorporating the
-    feedback, in place (same record). Refinement runs in the background (the LLM
-    call otherwise exceeds the preview gateway timeout): the request returns
-    immediately with the plan in ``refining`` state, and the frontend polls
-    until it settles. On success an already-approved plan stays approved so it
-    can be redeployed; otherwise it returns to ``generated``. A plan already
-    deploying, generating, or refining cannot be refined.
+    Shared by the text-only ``/refine`` endpoint and the multipart
+    ``/refine-with-images`` endpoint. Refinement runs in the background (the LLM
+    call otherwise exceeds the preview gateway timeout): the plan is set to
+    ``refining`` and returned immediately, and the frontend polls until it
+    settles. On success an already-approved plan stays approved so it can be
+    redeployed; otherwise it returns to ``generated``. A plan already deploying,
+    generating, or refining cannot be refined.
     """
-    feedback = (payload.feedback or "").strip()
+    feedback = (feedback or "").strip()
     if not feedback:
         raise HTTPException(status_code=422, detail="Feedback must not be empty.")
 
@@ -659,9 +660,41 @@ async def refine_existing_plan(
     await db.refresh(plan)
 
     asyncio.create_task(
-        _run_refinement_background(plan.id, user.id, feedback, prev_status)
+        _run_refinement_background(
+            plan.id, user.id, feedback, prev_status, images=images or None
+        )
     )
     return PlanOut.model_validate(plan)
+
+
+@router.post("/plans/{plan_id}/refine", response_model=PlanOut)
+async def refine_existing_plan(
+    plan_id: int,
+    payload: RefinePlanRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> PlanOut:
+    """Human-in-the-loop refinement: revise the same plan from reviewer feedback."""
+    return await _start_refinement(db, user, plan_id, payload.feedback or "")
+
+
+@router.post("/plans/{plan_id}/refine-with-images", response_model=PlanOut)
+async def refine_existing_plan_with_images(
+    plan_id: int,
+    feedback: str = Form(..., description="Reviewer feedback describing the issue"),
+    files: list[UploadFile] = File(default=[]),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> PlanOut:
+    """Refine a plan from feedback plus optional screenshots of the issue.
+
+    Same lifecycle as ``/refine``, but accepts multipart image uploads (e.g. a
+    screenshot of the broken functionality) that are passed to the LLM as visual
+    context so it can correct the plan. ``files`` are validated like design
+    uploads (type, size, count).
+    """
+    images = await _read_image_uploads(files)
+    return await _start_refinement(db, user, plan_id, feedback, images=images or None)
 
 
 @router.post("/plans/{plan_id}/approve", response_model=PlanOut)

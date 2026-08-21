@@ -140,6 +140,17 @@ export const planningApi = {
     });
     return data;
   },
+  async refineWithImages(id: number, feedback: string, files: File[]) {
+    const form = new FormData();
+    form.set("feedback", feedback);
+    files.forEach((f) => form.append("files", f));
+    const { data } = await api.post<Plan>(
+      `/planning/plans/${id}/refine-with-images`,
+      form,
+      { headers: { "Content-Type": "multipart/form-data" } },
+    );
+    return data;
+  },
   async approve(id: number) {
     const { data } = await api.post<Plan>(`/planning/plans/${id}/approve`);
     return data;
