@@ -37,6 +37,9 @@ export default function GeneratePage() {
   const [gathering, setGathering] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [designFiles, setDesignFiles] = useState<UploadFile[]>([]);
+  // Chosen at gather time; not part of the context. Carried to the plan page so
+  // the plan can be reviewed against it after generation.
+  const [checklistConnId, setChecklistConnId] = useState<number | null>(null);
   const [gatherForm] = Form.useForm();
   const [ctxForm] = Form.useForm();
 
@@ -52,12 +55,36 @@ export default function GeneratePage() {
   async function onGather() {
     const values = await gatherForm.validateFields().catch(() => null);
     if (!values) return;
+    // checklist selection is not a gather-context input; keep it client-side.
+    const { checklist_connection_id, ...gatherValues } = values;
+    setChecklistConnId(
+      checklist_connection_id != null ? Number(checklist_connection_id) : null,
+    );
     setGathering(true);
     try {
-      const ctx = await planningApi.gatherContext(values);
+      const ctx = await planningApi.gatherContext(gatherValues);
       setContext(ctx);
       ctxForm.setFieldsValue(toFormValues(ctx));
-      message.success("Context gathered — review and edit below");
+      // Surface JIRA image attachments in the existing upload area as
+      // done-status entries with data-URL thumbnails. They flow to the backend
+      // via the context (not as multipart), so they carry no originFileObj.
+      const jiraEntries: UploadFile[] = (ctx.jira_images || []).map((img, i) => ({
+        uid: `jira-${i}`,
+        name: img.filename,
+        status: "done" as const,
+        url: `data:${img.media_type};base64,${img.data}`,
+        thumbUrl: `data:${img.media_type};base64,${img.data}`,
+      }));
+      setDesignFiles((prev) => [
+        ...jiraEntries,
+        ...prev.filter((f) => !f.uid.startsWith("jira-")),
+      ]);
+      const count = jiraEntries.length;
+      message.success(
+        count > 0
+          ? `Context gathered — ${count} JIRA image${count === 1 ? "" : "s"} attached. Review and edit below.`
+          : "Context gathered — review and edit below",
+      );
     } catch {
       message.error("Failed to gather context");
     } finally {
@@ -70,15 +97,41 @@ export default function GeneratePage() {
     setGenerating(true);
     try {
       const ctx = fromFormValues(values);
+      // The Salesforce org-context fields are no longer shown in the form; carry
+      // the gathered values through so the planner still receives full org
+      // context (edition, objects, fields, flows, apex, permission sets,
+      // packages, profiles). jira_images and existing_layouts are likewise not
+      // form fields — the latter is required so layout_edits merge into the real
+      // layout (else deploy fails on "required layout field: Name").
+      if (context) {
+        ctx.sf_org_edition = context.sf_org_edition ?? "";
+        ctx.sf_api_version = context.sf_api_version ?? "";
+        ctx.lsc_modules = context.lsc_modules ?? [];
+        ctx.installed_packages = context.installed_packages ?? [];
+        ctx.metadata_objects = context.metadata_objects ?? [];
+        ctx.metadata_fields = context.metadata_fields ?? [];
+        ctx.metadata_flows = context.metadata_flows ?? [];
+        ctx.metadata_apex_classes = context.metadata_apex_classes ?? [];
+        ctx.metadata_permission_sets = context.metadata_permission_sets ?? [];
+        ctx.metadata_profiles = context.metadata_profiles ?? [];
+      }
+      ctx.jira_images = context?.jira_images ?? [];
+      ctx.existing_layouts = context?.existing_layouts ?? {};
       const files = designFiles
         .map((f) => f.originFileObj as File | undefined)
         .filter((f): f is File => !!f);
+      // Generation runs in the background: the API returns a pending plan
+      // (status "generating") immediately, and PlanDetailPage polls until it
+      // is ready. This avoids the preview gateway aborting the long LLM call
+      // and showing a false failure while the plan actually succeeds.
       const plan =
         files.length > 0
           ? await planningApi.generateWithImages(ctx, files)
           : await planningApi.generate(ctx);
-      message.success("Plan generated");
-      navigate(`/plans/${plan.id}`);
+      message.success("Generating plan…");
+      navigate(`/plans/${plan.id}`, {
+        state: checklistConnId ? { checklistConnId } : undefined,
+      });
     } catch (e: unknown) {
       const detail = extractError(e);
       message.error(detail);
@@ -123,6 +176,16 @@ export default function GeneratePage() {
             <Form.Item name="sfdx_path" label="SFDX project path (optional)">
               <Input placeholder="/path/to/sfdx-project" />
             </Form.Item>
+            <Form.Item
+              name="checklist_connection_id"
+              label="Review checklist (optional)"
+            >
+              <Select
+                allowClear
+                options={byType("checklist")}
+                placeholder="Select a checklist to review against"
+              />
+            </Form.Item>
             <Button type="primary" block loading={gathering} onClick={onGather}>
               Gather Context
             </Button>
@@ -166,49 +229,83 @@ export default function GeneratePage() {
               <TextArea rows={3} />
             </Form.Item>
 
-            <Divider orientation="left">Salesforce Org Context</Divider>
-            <Row gutter={12}>
-              <Col span={8}>
-                <Form.Item name="sf_org_edition" label="Org edition">
-                  <Input />
-                </Form.Item>
-              </Col>
-              <Col span={16}>
-                <Form.Item name="lsc_modules" label="LSC modules active">
-                  <Select mode="tags" tokenSeparators={[","]} />
-                </Form.Item>
-              </Col>
-            </Row>
-            <Form.Item name="metadata_objects" label="Relevant objects">
-              <Select mode="tags" tokenSeparators={[","]} />
+            <Divider orientation="left">Access Enablement</Divider>
+            <Form.Item
+              name="enablement_target"
+              label="Enable new access via"
+              extra="Choose how the plan should grant access for anything this story adds (field-level security, object/tab/app visibility, Apex access)."
+            >
+              <Select
+                allowClear
+                placeholder="Select mechanism"
+                options={[
+                  { value: "profile", label: "Profile" },
+                  { value: "permission_set", label: "Permission Set" },
+                ]}
+              />
             </Form.Item>
-            <Form.Item name="metadata_fields" label="Relevant fields">
-              <Select mode="tags" tokenSeparators={[","]} />
+            <Form.Item
+              noStyle
+              shouldUpdate={(prev, cur) =>
+                prev.enablement_target !== cur.enablement_target
+              }
+            >
+              {({ getFieldValue }) => {
+                const target = getFieldValue("enablement_target");
+                if (target === "profile") {
+                  return (
+                    <Form.Item
+                      name="enablement_profiles"
+                      label="Profiles"
+                      rules={[
+                        {
+                          required: true,
+                          message: "Select at least one profile",
+                        },
+                      ]}
+                    >
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        placeholder="Select profiles to enable"
+                        options={(context?.metadata_profiles ?? []).map((p) => ({
+                          value: p,
+                          label: p,
+                        }))}
+                        showSearch
+                        optionFilterProp="label"
+                      />
+                    </Form.Item>
+                  );
+                }
+                if (target === "permission_set") {
+                  return (
+                    <Form.Item
+                      name="enablement_permission_sets"
+                      label="Permission sets"
+                      rules={[
+                        {
+                          required: true,
+                          message: "Select at least one permission set",
+                        },
+                      ]}
+                    >
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        placeholder="Select permission sets to enable"
+                        options={(context?.metadata_permission_sets ?? []).map(
+                          (p) => ({ value: p, label: p }),
+                        )}
+                        showSearch
+                        optionFilterProp="label"
+                      />
+                    </Form.Item>
+                  );
+                }
+                return null;
+              }}
             </Form.Item>
-            <Row gutter={12}>
-              <Col span={12}>
-                <Form.Item name="metadata_flows" label="Relevant flows">
-                  <Select mode="tags" tokenSeparators={[","]} />
-                </Form.Item>
-              </Col>
-              <Col span={12}>
-                <Form.Item name="metadata_apex_classes" label="Relevant Apex classes">
-                  <Select mode="tags" tokenSeparators={[","]} />
-                </Form.Item>
-              </Col>
-            </Row>
-            <Row gutter={12}>
-              <Col span={12}>
-                <Form.Item name="metadata_permission_sets" label="Permission sets">
-                  <Select mode="tags" tokenSeparators={[","]} />
-                </Form.Item>
-              </Col>
-              <Col span={12}>
-                <Form.Item name="installed_packages" label="Installed packages">
-                  <Select mode="tags" tokenSeparators={[","]} />
-                </Form.Item>
-              </Col>
-            </Row>
 
             <Divider orientation="left">GitHub Context</Divider>
             <Form.Item name="github_branch" label="Branch">
@@ -278,6 +375,9 @@ function fromFormValues(values: Record<string, unknown>): PlanningContext {
     "metadata_flows",
     "metadata_apex_classes",
     "metadata_permission_sets",
+    "metadata_profiles",
+    "enablement_profiles",
+    "enablement_permission_sets",
     "github_recent_commits",
     "github_open_prs",
   ];
@@ -285,6 +385,8 @@ function fromFormValues(values: Record<string, unknown>): PlanningContext {
   listFields.forEach((f) => {
     if (!out[f]) out[f] = [];
   });
+  if (!out.jira_images) out.jira_images = [];
+  if (!out.existing_layouts) out.existing_layouts = {};
   const stringFields = [
     "jira_ticket_id",
     "jira_summary",
@@ -293,6 +395,8 @@ function fromFormValues(values: Record<string, unknown>): PlanningContext {
     "jira_type",
     "jira_priority",
     "sf_org_edition",
+    "sf_api_version",
+    "enablement_target",
     "github_branch",
   ];
   stringFields.forEach((f) => {

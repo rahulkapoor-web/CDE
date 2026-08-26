@@ -19,23 +19,36 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.connectors.sfdx import parse_sfdx_project
-from app.core.database import get_db
+from app.core.database import AsyncSessionLocal, get_db
 from app.llm.base import ImageInput
 from app.llm.factory import get_llm_provider
+from app.models.connection import CHECKLIST as CHECKLIST_CONN_TYPE
+from app.models.connection import GITHUB as GITHUB_CONN_TYPE
+from app.models.connection import JIRA as JIRA_CONN_TYPE
 from app.models.connection import SALESFORCE as SALESFORCE_CONN_TYPE
 from app.models.connection import Connection
 from app.models.plan import Plan as PlanModel
 from app.models.plan import PlanStatus
 from app.models.user import User
+from app.schemas.plan import LayoutEdit
 from app.schemas.plan import Plan as PlanSchema
 from app.schemas.plan_schema import PLAN_JSON_SCHEMA
 from app.schemas.planning import (
+    ChecklistItemResult,
+    CommitToGithubRequest,
     DeployPlanRequest,
     GatherContextRequest,
     GeneratePlanRequest,
+    GithubCommitOut,
+    JiraCommentOut,
+    JiraImage,
     PlanningContext,
     PlanOut,
     PlanSummaryOut,
+    PostTestPlanToJiraRequest,
+    RefinePlanRequest,
+    ReviewAgainstChecklistOut,
+    ReviewAgainstChecklistRequest,
 )
 from app.services.connections import (
     github_from_connection,
@@ -43,11 +56,19 @@ from app.services.connections import (
     salesforce_from_connection,
 )
 from app.services.deployer import (
+    DEFAULT_API_VERSION,
     NoDeployableMetadataError,
     build_package_zip,
     deploy_plan,
+    filter_plan_for_deploy,
 )
-from app.services.planner import PlanGenerationError, generate_plan
+from app.services.checklist_review import review_plan_against_checklist
+from app.services.deploy_validation import validate_deployable
+from app.services.layout_merge import resolve_layout_edit
+from app.services import static_resources
+from app.services.packager import build_repo_artifact
+from app.services.target_detection import detect_target_objects
+from app.services.planner import PlanGenerationError, generate_plan, refine_plan
 from app.services.rag import retrieve_context
 
 logger = logging.getLogger(__name__)
@@ -57,6 +78,8 @@ router = APIRouter(prefix="/planning", tags=["planning"])
 _ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 _MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB per image (Anthropic API limit)
 _MAX_IMAGES = 4
+# Cap the number of layouts retrieved from the org to keep context manageable.
+_MAX_LAYOUTS = 10
 
 
 async def _owned_conn(db, user, conn_id: int | None) -> Connection | None:
@@ -94,8 +117,10 @@ async def gather_context(
             data = await jira_from_connection(jira_conn).fetch_ticket(
                 payload.jira_ticket_id
             )
+            images = data.pop("jira_images", []) or []
             for k, v in data.items():
                 setattr(ctx, k, v)
+            ctx.jira_images = [JiraImage.model_validate(i) for i in images]
         except Exception as exc:  # noqa: BLE001
             logger.warning("JIRA fetch failed: %s", exc)
             ctx.jira_ticket_id = payload.jira_ticket_id
@@ -115,12 +140,40 @@ async def gather_context(
 
     sf_conn = await _owned_conn(db, user, payload.salesforce_connection_id)
     if sf_conn:
+        # Story text scopes the org pull to objects the ticket references, so we
+        # describe the story's fields and retrieve its layouts rather than
+        # scanning the whole org ("only what the story asks").
+        story_text = " ".join(
+            [
+                ctx.jira_summary or "",
+                ctx.jira_description or "",
+                ctx.jira_acceptance_criteria or "",
+            ]
+        )
         try:
+            sf = salesforce_from_connection(sf_conn)
             data = await asyncio.to_thread(
-                salesforce_from_connection(sf_conn).fetch_metadata
+                sf.fetch_metadata, None, story_text or None
             )
             for k, v in data.items():
                 setattr(ctx, k, v)
+
+            # Retrieve existing Layout XML for the objects in scope so the
+            # planner can automate layout changes (insert the field into the
+            # real layout) instead of leaving them as a manual step. Scope the
+            # pull to objects the story actually references so we don't retrieve
+            # layouts for the entire org.
+            try:
+                objects = ctx.metadata_objects or []
+                targets = detect_target_objects(story_text, objects)
+                scope = targets or objects
+                layout_names = await asyncio.to_thread(sf.list_layouts, scope)
+                if layout_names:
+                    ctx.existing_layouts = await asyncio.to_thread(
+                        sf.fetch_layouts, layout_names[:_MAX_LAYOUTS]
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Layout retrieve failed: %s", exc)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Salesforce metadata fetch failed: %s", exc)
 
@@ -141,17 +194,209 @@ async def gather_context(
     return ctx
 
 
-async def _run_generation(
+def _resolve_layout_edits(plan_dict: dict, ctx: PlanningContext) -> dict:
+    """Turn each step's declarative ``layout_edits`` into deployable layout files.
+
+    Uses the org's existing layout XML (``ctx.existing_layouts``) so the emitted
+    ``.layout`` preserves every required item (fixing the "must contain an item
+    for required layout field: Name" deploy error). The merged file and its
+    Layout package member are injected into the step's ``metadata_artifact``.
+
+    If a layout's existing XML isn't available we leave the edit in place (it is
+    surfaced to the developer) rather than fabricate a partial layout.
+    """
+    existing = ctx.existing_layouts or {}
+    steps = plan_dict.get("steps")
+    if not isinstance(steps, list):
+        return plan_dict
+
+    for step in steps:
+        edits = step.get("layout_edits") or []
+        if not edits:
+            continue
+        new_files: list[dict] = []
+        new_members: list[dict] = []
+        for edit in edits:
+            try:
+                le = LayoutEdit.model_validate(edit)
+            except Exception:  # noqa: BLE001
+                continue
+            resolved = resolve_layout_edit(le, existing)
+            if resolved is None:
+                logger.warning(
+                    "No existing XML for layout '%s'; cannot auto-merge. "
+                    "Field placement left as a declared edit.",
+                    le.layout_name,
+                )
+                continue
+            path, xml = resolved
+            new_files.append({"path": path, "body": xml})
+            new_members.append({"type": "Layout", "name": le.layout_name})
+
+        if not new_files:
+            continue
+
+        artifact = step.get("metadata_artifact")
+        if not isinstance(artifact, dict):
+            artifact = {"files": [], "members": [], "api_version": None}
+        artifact.setdefault("files", [])
+        artifact.setdefault("members", [])
+        # Replace any prior layout files for the same paths (avoid duplicates).
+        new_paths = {f["path"] for f in new_files}
+        artifact["files"] = [
+            f for f in artifact["files"] if f.get("path") not in new_paths
+        ] + new_files
+        existing_member_keys = {
+            (m.get("type"), m.get("name")) for m in artifact["members"]
+        }
+        for m in new_members:
+            if (m["type"], m["name"]) not in existing_member_keys:
+                artifact["members"].append(m)
+        step["metadata_artifact"] = artifact
+
+    return plan_dict
+
+
+def _resolve_static_resources(plan_dict: dict) -> dict:
+    """Materialize each step's declarative ``static_resources`` into artifacts.
+
+    The LLM cannot author a binary zipped StaticResource, so it just names known
+    libraries (e.g. ``["pdfjs", "pdflib"]``). Here we replace those names with a
+    server-built ``.resource`` (base64 zip) + ``.resource-meta.xml`` and a
+    StaticResource package member, mirroring how ``layout_edits`` are resolved.
+    Unknown keys are dropped with a warning rather than failing the plan.
+    """
+    steps = plan_dict.get("steps")
+    if not isinstance(steps, list):
+        return plan_dict
+
+    for step in steps:
+        keys = step.get("static_resources") or []
+        if not keys:
+            continue
+        new_files: list[dict] = []
+        new_members: list[dict] = []
+        for raw in keys:
+            key = str(raw).strip()
+            if not static_resources.is_known(key):
+                logger.warning(
+                    "Unknown static resource '%s' requested; skipping. Known: %s",
+                    key,
+                    static_resources.known_keys(),
+                )
+                continue
+            new_files.extend(static_resources.resource_files(key))
+            new_members.append(static_resources.resource_member(key))
+
+        if not new_files:
+            continue
+
+        artifact = step.get("metadata_artifact")
+        if not isinstance(artifact, dict):
+            artifact = {"files": [], "members": [], "api_version": None}
+        artifact.setdefault("files", [])
+        artifact.setdefault("members", [])
+        # Replace any prior files for the same resource paths (idempotent).
+        new_paths = {f["path"] for f in new_files}
+        artifact["files"] = [
+            f for f in artifact["files"] if f.get("path") not in new_paths
+        ] + new_files
+        existing_member_keys = {
+            (m.get("type"), m.get("name")) for m in artifact["members"]
+        }
+        for m in new_members:
+            if (m["type"], m["name"]) not in existing_member_keys:
+                artifact["members"].append(m)
+        step["metadata_artifact"] = artifact
+
+    return plan_dict
+
+
+def _unresolved_layout_names(plan_dict: dict) -> list[str]:
+    """Layout fullNames declared in layout_edits that have no deployable file yet."""
+    names: list[str] = []
+    for step in plan_dict.get("steps") or []:
+        edits = step.get("layout_edits") or []
+        if not edits:
+            continue
+        artifact = step.get("metadata_artifact") or {}
+        existing_paths = {
+            f.get("path") for f in (artifact.get("files") or [])
+        }
+        for edit in edits:
+            name = (edit or {}).get("layout_name")
+            if not name:
+                continue
+            path = f"layouts/{name}.layout"
+            if path not in existing_paths:
+                names.append(name)
+    # De-dup, preserve order.
+    return list(dict.fromkeys(names))
+
+
+def _resolve_layout_edits_live(plan_dict: dict, connector) -> tuple[dict, bool]:
+    """Resolve unresolved layout_edits by fetching the target org's real layout.
+
+    Returns ``(plan_dict, changed)``. Fetches only the layouts that still lack a
+    deployable file, merges edits into that real XML (preserving required items),
+    and injects the resulting files/members. Runs in a worker thread (blocking
+    SF calls). No-op when everything is already resolved.
+    """
+    needed = _unresolved_layout_names(plan_dict)
+    if not needed:
+        return plan_dict, False
+
+    object_names = list(
+        dict.fromkeys(n.split("-", 1)[0] for n in needed if "-" in n)
+    )
+    connector.connect()
+    # Prefer listing to validate the fullNames exist, but fetch by name directly.
+    fetched = connector.fetch_layouts(needed) or {}
+    if not fetched:
+        # Fall back to listing by object then fetching, in case fullName casing
+        # differs from what the plan declared.
+        listed = connector.list_layouts(object_names) if object_names else []
+        if listed:
+            fetched = connector.fetch_layouts(listed) or {}
+    if not fetched:
+        logger.warning(
+            "Could not retrieve layout XML for %s from target org; "
+            "deploy may fail if the layout is required.",
+            needed,
+        )
+        return plan_dict, False
+
+    ctx = PlanningContext(existing_layouts=fetched)
+    before = json.dumps(plan_dict, sort_keys=True)
+    plan_dict = _resolve_layout_edits(plan_dict, ctx)
+    changed = json.dumps(plan_dict, sort_keys=True) != before
+    return plan_dict, changed
+
+
+async def _generate_plan_body(
     db: AsyncSession,
-    user: User,
     ctx: PlanningContext,
-    images: list[ImageInput] | None = None,
-) -> PlanOut:
-    """Shared plan-generation pipeline for JSON and multipart entrypoints."""
+    images: list[ImageInput] | None,
+):
+    """Run the LLM pipeline and return ``(plan, plan_dict, provider)``.
+
+    Raises ``HTTPException`` on provider unavailability so the synchronous
+    entrypoints can surface it before a pending record is created.
+    """
     try:
         provider = get_llm_provider()
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"LLM provider unavailable: {exc}")
+
+    # Feed JIRA-attached images to the planner alongside any manual uploads, so
+    # a ticket's design attachments inform the plan even without a re-upload.
+    jira_images = [
+        ImageInput(media_type=img.media_type, data=img.data)
+        for img in (ctx.jira_images or [])
+        if img.data
+    ]
+    if jira_images:
+        images = (images or []) + jira_images
 
     query = " ".join(
         [ctx.jira_summary, ctx.jira_description, ctx.jira_acceptance_criteria]
@@ -162,33 +407,88 @@ async def _run_generation(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Guide retrieval failed: %s", exc)
 
+    plan, plan_dict = await generate_plan(
+        provider, ctx, guide_context, images=images
+    )
+    plan_dict = _resolve_layout_edits(plan_dict, ctx)
+    plan_dict = _resolve_static_resources(plan_dict)
+    return plan, plan_dict, provider
+
+
+async def _run_generation_background(
+    plan_id: int,
+    ctx: PlanningContext,
+    images: list[ImageInput] | None = None,
+) -> None:
+    """Generate a plan in the background and update the pending record.
+
+    Runs with its own DB session (the request session is closed once the
+    endpoint returns). On success the record moves to ``generated``; on failure
+    it moves to ``generation_failed`` with ``generation_error`` set so the UI
+    can show why instead of leaving the plan stuck as ``generating``.
+    """
+    async with AsyncSessionLocal() as db:
+        record = await db.get(PlanModel, plan_id)
+        if record is None:
+            logger.warning("Background generation: plan %s vanished", plan_id)
+            return
+        try:
+            plan, plan_dict, provider = await _generate_plan_body(db, ctx, images)
+        except PlanGenerationError as exc:
+            record.status = PlanStatus.GENERATION_FAILED
+            record.generation_error = str(exc)
+            await db.commit()
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Background generation failed for plan %s", plan_id)
+            record.status = PlanStatus.GENERATION_FAILED
+            record.generation_error = f"Generation failed: {exc}"
+            await db.commit()
+            return
+
+        record.jira_ticket = plan.jira_ticket
+        record.summary = plan.summary
+        record.status = PlanStatus.GENERATED
+        record.provider = provider.name
+        record.model = getattr(provider, "_model", None)
+        record.plan_json = plan_dict
+        record.generation_error = None
+        await db.commit()
+
+
+async def _start_generation(
+    db: AsyncSession,
+    user: User,
+    ctx: PlanningContext,
+    images: list[ImageInput] | None = None,
+) -> PlanOut:
+    """Create a pending plan and kick off background generation.
+
+    Returns the pending ``PlanOut`` (status ``generating``) immediately so the
+    HTTP request never outlives the preview gateway timeout. The frontend polls
+    the plan until it reaches ``generated`` or ``generation_failed``.
+    """
+    # Fail fast if the provider can't be constructed, so the user gets an
+    # immediate error rather than a pending plan that will never complete.
     try:
-        plan, plan_dict = await generate_plan(
-            provider, ctx, guide_context, images=images
-        )
-    except PlanGenerationError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": str(exc),
-                "attempts": exc.attempts,
-                "errors": exc.last_errors,
-            },
-        )
+        get_llm_provider()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"LLM provider unavailable: {exc}")
 
     record = PlanModel(
         user_id=user.id,
-        jira_ticket=plan.jira_ticket,
-        summary=plan.summary,
-        status="generated",
-        provider=provider.name,
-        model=getattr(provider, "_model", None),
+        jira_ticket=ctx.jira_ticket_id or "PENDING",
+        summary=ctx.jira_summary or None,
+        status=PlanStatus.GENERATING,
         context_snapshot=ctx.model_dump(),
-        plan_json=plan_dict,
+        plan_json={},
     )
     db.add(record)
     await db.commit()
     await db.refresh(record)
+
+    # Detach from the request lifecycle: the task owns its own DB session.
+    asyncio.create_task(_run_generation_background(record.id, ctx, images))
     return PlanOut.model_validate(record)
 
 
@@ -232,7 +532,7 @@ async def generate(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> PlanOut:
-    return await _run_generation(db, user, payload.context)
+    return await _start_generation(db, user, payload.context)
 
 
 @router.post("/generate-with-images", response_model=PlanOut)
@@ -253,7 +553,7 @@ async def generate_with_images(
         raise HTTPException(status_code=422, detail=f"Invalid context: {exc}")
 
     images = await _read_image_uploads(files)
-    return await _run_generation(db, user, ctx, images=images or None)
+    return await _start_generation(db, user, ctx, images=images or None)
 
 
 @router.get("/plans", response_model=list[PlanSummaryOut])
@@ -288,6 +588,172 @@ async def get_plan(
 ):
     plan = await _owned_plan(db, user, plan_id)
     return PlanOut.model_validate(plan)
+
+
+async def _run_refinement_background(
+    plan_id: int,
+    user_id: int,
+    feedback: str,
+    prev_status: str,
+    images: list[ImageInput] | None = None,
+) -> None:
+    """Refine a plan in the background and update the record in place.
+
+    Runs with its own DB session. The plan keeps its previous content while
+    ``REFINING``. On success the refined content replaces it and the lifecycle
+    is set based on ``prev_status`` (an already-approved plan stays approved so
+    the reviewer can redeploy immediately; otherwise it returns to
+    ``generated``). On failure the plan is restored to ``prev_status`` with the
+    error recorded in ``generation_error`` so the UI can show why.
+    """
+    async with AsyncSessionLocal() as db:
+        plan = await db.get(PlanModel, plan_id)
+        if plan is None:
+            logger.warning("Background refinement: plan %s vanished", plan_id)
+            return
+
+        ctx = PlanningContext.model_validate(plan.context_snapshot or {})
+        guide_context = ""
+        query = " ".join(
+            [ctx.jira_summary, ctx.jira_description, ctx.jira_acceptance_criteria]
+        ).strip()
+        try:
+            provider = get_llm_provider()
+            try:
+                guide_context = await retrieve_context(
+                    db, query or ctx.jira_ticket_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Guide retrieval failed: %s", exc)
+            refined, refined_dict = await refine_plan(
+                provider, ctx, plan.plan_json, feedback, guide_context, images=images
+            )
+        except PlanGenerationError as exc:
+            plan.status = prev_status
+            plan.generation_error = str(exc)
+            await db.commit()
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Background refinement failed for plan %s", plan_id)
+            plan.status = prev_status
+            plan.generation_error = f"Refinement failed: {exc}"
+            await db.commit()
+            return
+
+        refined_dict = _resolve_layout_edits(refined_dict, ctx)
+        refined_dict = _resolve_static_resources(refined_dict)
+
+        # If the reviewer refines a plan they had already approved (typically to
+        # fix a failed deployment), keep it approved so they can redeploy
+        # immediately. Only a never-approved plan returns to `generated`.
+        was_approved = prev_status in (
+            PlanStatus.APPROVED,
+            PlanStatus.DEPLOYED,
+            PlanStatus.DEPLOY_FAILED,
+        )
+
+        plan.summary = refined.summary
+        plan.plan_json = refined_dict
+        plan.provider = provider.name
+        plan.model = getattr(provider, "_model", None)
+        plan.generation_error = None
+        # Clear prior deploy execution state; refined content must be redeployed.
+        plan.deploy_async_id = None
+        plan.deploy_started_at = None
+        plan.deploy_finished_at = None
+        plan.deploy_result = None
+        if was_approved:
+            plan.status = PlanStatus.APPROVED
+            plan.approved_at = func.now()
+            plan.approved_by_id = user_id
+        else:
+            plan.status = PlanStatus.GENERATED
+            plan.approved_at = None
+            plan.approved_by_id = None
+            plan.deploy_connection_id = None
+        await db.commit()
+
+
+async def _start_refinement(
+    db: AsyncSession,
+    user: User,
+    plan_id: int,
+    feedback: str,
+    images: list[ImageInput] | None = None,
+) -> PlanOut:
+    """Validate, gate, and kick off a background refinement for a plan.
+
+    Shared by the text-only ``/refine`` endpoint and the multipart
+    ``/refine-with-images`` endpoint. Refinement runs in the background (the LLM
+    call otherwise exceeds the preview gateway timeout): the plan is set to
+    ``refining`` and returned immediately, and the frontend polls until it
+    settles. On success an already-approved plan stays approved so it can be
+    redeployed; otherwise it returns to ``generated``. A plan already deploying,
+    generating, or refining cannot be refined.
+    """
+    feedback = (feedback or "").strip()
+    if not feedback:
+        raise HTTPException(status_code=422, detail="Feedback must not be empty.")
+
+    plan = await _owned_plan(db, user, plan_id)
+    if plan.status in (
+        PlanStatus.DEPLOYING,
+        PlanStatus.GENERATING,
+        PlanStatus.REFINING,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot refine a plan in status '{plan.status}'.",
+        )
+
+    # Fail fast if the provider can't be constructed.
+    try:
+        get_llm_provider()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"LLM provider unavailable: {exc}")
+
+    prev_status = plan.status
+    plan.status = PlanStatus.REFINING
+    plan.generation_error = None
+    await db.commit()
+    await db.refresh(plan)
+
+    asyncio.create_task(
+        _run_refinement_background(
+            plan.id, user.id, feedback, prev_status, images=images or None
+        )
+    )
+    return PlanOut.model_validate(plan)
+
+
+@router.post("/plans/{plan_id}/refine", response_model=PlanOut)
+async def refine_existing_plan(
+    plan_id: int,
+    payload: RefinePlanRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> PlanOut:
+    """Human-in-the-loop refinement: revise the same plan from reviewer feedback."""
+    return await _start_refinement(db, user, plan_id, payload.feedback or "")
+
+
+@router.post("/plans/{plan_id}/refine-with-images", response_model=PlanOut)
+async def refine_existing_plan_with_images(
+    plan_id: int,
+    feedback: str = Form(..., description="Reviewer feedback describing the issue"),
+    files: list[UploadFile] = File(default=[]),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> PlanOut:
+    """Refine a plan from feedback plus optional screenshots of the issue.
+
+    Same lifecycle as ``/refine``, but accepts multipart image uploads (e.g. a
+    screenshot of the broken functionality) that are passed to the LLM as visual
+    context so it can correct the plan. ``files`` are validated like design
+    uploads (type, size, count).
+    """
+    images = await _read_image_uploads(files)
+    return await _start_refinement(db, user, plan_id, feedback, images=images or None)
 
 
 @router.post("/plans/{plan_id}/approve", response_model=PlanOut)
@@ -364,15 +830,79 @@ async def deploy_approved_plan(
             detail="deploy target must be a Salesforce connection.",
         )
 
+    connector = salesforce_from_connection(conn)
+
+    # Ground the package to the TARGET org's real API version so a stale or
+    # inconsistent LLM-authored apiVersion in Apex/LWC meta files never fails the
+    # deploy. Falls back to the deployer default if the org can't be queried.
+    try:
+        org_api_version = await asyncio.to_thread(connector.get_api_version)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not fetch org API version before deploy: %s", exc)
+        org_api_version = DEFAULT_API_VERSION
+
+    # Safety net: ensure every declared layout_edit is resolved into a complete
+    # layout file against the REAL layout in the TARGET org. This guarantees a
+    # correct deploy even if the stored context lacked existing_layouts (e.g. an
+    # older plan generated before layout XML was carried through), and it always
+    # merges into the org we're deploying to. Persist any newly resolved files.
+    try:
+        plan_dict, changed = await asyncio.to_thread(
+            _resolve_layout_edits_live, plan.plan_json, connector
+        )
+        if changed:
+            plan.plan_json = plan_dict
+            await db.commit()
+            await db.refresh(plan)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Live layout resolution before deploy failed: %s", exc)
+
     plan_schema = PlanSchema.model_validate(plan.plan_json)
 
-    # Fail fast with a clear message if there's nothing to deploy.
-    try:
-        build_package_zip(plan_schema)
-    except NoDeployableMetadataError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+    # Apply the reviewer's deploy-time selection (UI-only; not persisted). When
+    # both are None this is a no-op and the full plan deploys.
+    if payload.step_numbers is not None or payload.artifact_paths is not None:
+        plan_schema = filter_plan_for_deploy(
+            plan_schema,
+            step_numbers=payload.step_numbers,
+            artifact_paths=payload.artifact_paths,
+        )
 
-    connector = salesforce_from_connection(conn)
+    # Pre-deploy sanity checks: catch self-inconsistent plans (non-deployable
+    # OmniStudio types, custom objects referenced but never created) BEFORE the
+    # Metadata API rejects the whole package with a wall of cascading errors.
+    # The org's object list lets us treat objects already in the org as present.
+    org_objects = (plan.context_snapshot or {}).get("metadata_objects")
+    deploy_errors = validate_deployable(plan_schema, org_objects)
+    if deploy_errors:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This plan cannot be deployed as-is:\n- "
+                + "\n- ".join(deploy_errors)
+                + "\n\nRefine the plan to fix these, then retry the deploy."
+            ),
+        )
+
+    # Fail fast with a clear message if there's nothing to deploy, or if the
+    # package can't be assembled (e.g. genuinely conflicting metadata). Surface
+    # the reason to the UI instead of an opaque 500.
+    try:
+        build_package_zip(plan_schema, api_version=org_api_version)
+    except NoDeployableMetadataError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                str(exc)
+                if (payload.step_numbers is None and payload.artifact_paths is None)
+                else "No deployable metadata in the selected steps/files."
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not build the deployment package: {exc}",
+        )
 
     if not payload.check_only:
         plan.status = PlanStatus.DEPLOYING
@@ -390,6 +920,7 @@ async def deploy_approved_plan(
             plan_schema,
             is_sandbox=connector.is_sandbox,
             check_only=payload.check_only,
+            api_version=org_api_version,
         )
 
     try:
@@ -419,3 +950,197 @@ async def deploy_approved_plan(
     await db.commit()
     await db.refresh(plan)
     return PlanOut.model_validate(plan)
+
+
+def _default_commit_branch(plan: PlanModel) -> str:
+    ticket = (plan.jira_ticket or "plan").strip().replace(" ", "-")
+    return f"ona/{ticket}-{plan.id}"
+
+
+@router.post("/plans/{plan_id}/commit-github", response_model=GithubCommitOut)
+async def commit_plan_to_github(
+    plan_id: int,
+    payload: CommitToGithubRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> GithubCommitOut:
+    """Commit an approved plan's metadata to a branch in a connected repo.
+
+    An alternative to direct-org deploy: renders the plan's metadata in the
+    repo's format (SFDX source by default, or MDAPI) and commits it to a new
+    branch so the developer can review a diff and deploy from their pipeline.
+    The plan must be approved first. Commits to a branch only — no PR is opened.
+    """
+    plan = await _owned_plan(db, user, plan_id)
+    if plan.status not in (
+        PlanStatus.APPROVED,
+        PlanStatus.DEPLOYED,
+        PlanStatus.DEPLOY_FAILED,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Approve the plan before committing to GitHub (current status "
+                f"'{plan.status}'). Click Approve first."
+            ),
+        )
+
+    conn = await _owned_conn(db, user, payload.github_connection_id)
+    if conn.conn_type != GITHUB_CONN_TYPE:
+        raise HTTPException(
+            status_code=400,
+            detail="commit target must be a GitHub connection.",
+        )
+
+    plan_schema = PlanSchema.model_validate(plan.plan_json)
+
+    connector = github_from_connection(conn, payload.repo)
+
+    # Format resolution: explicit request > connection setting > repo auto-detect.
+    fmt = (payload.metadata_format or conn.config.get("metadata_format") or "").strip()
+    if fmt not in ("sfdx", "mdapi"):
+        try:
+            detected = await connector.detect_format(payload.base_branch)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("GitHub format detection failed: %s", exc)
+            detected = "unknown"
+        fmt = detected if detected in ("sfdx", "mdapi") else "sfdx"
+
+    try:
+        artifact = build_repo_artifact(plan_schema, fmt)
+    except NoDeployableMetadataError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    branch = (payload.branch or "").strip() or _default_commit_branch(plan)
+    message = (
+        payload.commit_message
+        or f"{plan.jira_ticket}: {plan.summary or 'ONA plan metadata'}"
+    )
+
+    try:
+        result = await connector.commit_files(
+            artifact.files,
+            branch=branch,
+            message=message,
+            base_branch=payload.base_branch,
+            binary_paths=artifact.binary_paths,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("GitHub commit failed for plan %s", plan_id)
+        raise HTTPException(status_code=502, detail=f"GitHub commit failed: {exc}")
+
+    return GithubCommitOut(
+        branch=result.branch,
+        commit_sha=result.commit_sha,
+        commit_url=result.commit_url,
+        branch_url=result.branch_url,
+        files=result.files,
+        created_branch=result.created_branch,
+        metadata_format=fmt,
+    )
+
+
+def _format_unit_test_plan_comment(plan: PlanModel) -> str:
+    """Render the plan's unit test plan as a JIRA comment body (plain text)."""
+    pj = plan.plan_json or {}
+    tr = pj.get("testing_requirements") or {}
+    lines = ["*ONA — Unit Test Plan*", ""]
+    unit = (tr.get("unit_tests") or "").strip()
+    lines.append(unit or "(No unit tests specified.)")
+
+    functional = (tr.get("functional_tests") or "").strip()
+    if functional:
+        lines += ["", "*Functional tests*", functional]
+    regression = (tr.get("regression_areas") or "").strip()
+    if regression:
+        lines += ["", "*Regression areas*", regression]
+    coverage = tr.get("minimum_code_coverage")
+    if coverage:
+        lines += ["", f"Minimum code coverage: {coverage}%"]
+    lines += ["", f"_Generated by ONA for plan {pj.get('plan_id', plan.id)}._"]
+    return "\n".join(lines)
+
+
+@router.post("/plans/{plan_id}/post-test-plan-jira", response_model=JiraCommentOut)
+async def post_test_plan_to_jira(
+    plan_id: int,
+    payload: PostTestPlanToJiraRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> JiraCommentOut:
+    """Post the plan's unit test plan as a comment on the story.
+
+    Writes the testing_requirements (unit tests + functional/regression/coverage)
+    to the linked JIRA issue as a comment. Non-destructive; can be posted anytime
+    after the plan is generated.
+    """
+    plan = await _owned_plan(db, user, plan_id)
+
+    conn = await _owned_conn(db, user, payload.jira_connection_id)
+    if conn.conn_type != JIRA_CONN_TYPE:
+        raise HTTPException(
+            status_code=400, detail="Select a JIRA connection to post the comment."
+        )
+
+    ticket_id = (payload.ticket_id or plan.jira_ticket or "").strip()
+    if not ticket_id:
+        raise HTTPException(
+            status_code=422, detail="No JIRA ticket associated with this plan."
+        )
+
+    body = _format_unit_test_plan_comment(plan)
+    try:
+        result = await jira_from_connection(conn).add_comment(ticket_id, body)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("JIRA comment failed for plan %s", plan_id)
+        raise HTTPException(status_code=502, detail=f"JIRA comment failed: {exc}")
+
+    return JiraCommentOut(
+        ticket_id=ticket_id,
+        comment_id=result.get("id"),
+        url=result.get("url", ""),
+    )
+
+
+@router.post(
+    "/plans/{plan_id}/review-checklist", response_model=ReviewAgainstChecklistOut
+)
+async def review_plan_checklist(
+    plan_id: int,
+    payload: ReviewAgainstChecklistRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ReviewAgainstChecklistOut:
+    """Review the plan against a checklist connection's rubric.
+
+    Uses the LLM to judge each checklist item against the plan and returns a
+    per-item pass/fail/partial result plus an overall verdict. Read-only.
+    """
+    plan = await _owned_plan(db, user, plan_id)
+
+    conn = await _owned_conn(db, user, payload.checklist_connection_id)
+    if conn.conn_type != CHECKLIST_CONN_TYPE:
+        raise HTTPException(
+            status_code=400, detail="Select a checklist connection to review against."
+        )
+    checklist_text = (conn.config or {}).get("content", "")
+    if not checklist_text.strip():
+        raise HTTPException(status_code=422, detail="Selected checklist is empty.")
+
+    try:
+        provider = get_llm_provider()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"LLM provider unavailable: {exc}")
+
+    review = await review_plan_against_checklist(
+        provider, plan.plan_json or {}, checklist_text
+    )
+
+    return ReviewAgainstChecklistOut(
+        checklist_name=conn.name,
+        overall=review["overall"],
+        summary=review["summary"],
+        results=[ChecklistItemResult(**r) for r in review["results"]],
+    )

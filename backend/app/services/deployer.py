@@ -13,18 +13,38 @@ tested without a live org. The deploy call is isolated in ``deploy_plan``.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import io
 import logging
+import re
 import time
 import zipfile
 from dataclasses import dataclass, field
+from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
 from app.schemas.plan import Plan
 
 logger = logging.getLogger(__name__)
 
+_MDAPI_NS = "http://soap.sforce.com/2006/04/metadata"
+
+# MDAPI metadata types whose single file aggregates many child members (e.g. a
+# CustomObject file holds all fields, validationRules, listViews...). When two
+# steps each emit the same such file with different children, they must be MERGED
+# into one file rather than rejected as conflicting.
+_MERGEABLE_SUFFIXES = (".object", ".object-meta.xml")
+
 DEFAULT_API_VERSION = "60.0"
+
+# Matches the version element inside Apex/LWC/Aura meta files, e.g.
+# <apiVersion>60.0</apiVersion>. Case-insensitive on the tag so both the
+# metadata <apiVersion> and any stray <version> in a meta file are normalized.
+_API_VERSION_RE = re.compile(
+    r"(<(?P<tag>apiVersion|version)>)\s*[\d.]+\s*(</(?P=tag)>)",
+    re.IGNORECASE,
+)
 
 # Terminal deploy states reported by the Metadata API.
 _TERMINAL_STATES = {"Succeeded", "Failed", "Canceled", "SucceededPartial"}
@@ -60,16 +80,335 @@ def _collect_members(plan: Plan) -> dict[str, list[str]]:
     return by_type
 
 
+def _is_mergeable(path: str) -> bool:
+    """True for MDAPI files that aggregate child members (e.g. CustomObject)."""
+    p = path.lower()
+    return p.endswith(_MERGEABLE_SUFFIXES)
+
+
+def _child_key(el: ET.Element) -> tuple[str, str]:
+    """Identity of a CustomObject child for merge dedup.
+
+    Uses the element tag plus its <fullName> (the member name Salesforce keys on,
+    e.g. a field's API name). Children without a fullName fall back to their
+    serialized text so identical singletons don't duplicate.
+    """
+    tag = el.tag.split("}")[-1]
+    full = el.find(f"{{{_MDAPI_NS}}}fullName")
+    if full is None:
+        full = el.find("fullName")
+    name = (full.text or "").strip() if full is not None else ""
+    if not name:
+        name = ET.tostring(el, encoding="unicode")
+    return (tag, name)
+
+
+def _merge_object_xml(existing: str, incoming: str) -> str:
+    """Merge two CustomObject XML documents into one.
+
+    A CustomObject `.object` file must contain ALL of an object's members (every
+    field, validationRule, etc.). When separate plan steps each create a
+    different member on the same object, they emit the same `objects/X.object`
+    path with only their own child — deploying either alone, or rejecting them as
+    "conflicting", is wrong. This unions their child elements (dedup by
+    tag+fullName) so the object deploys with every member present.
+
+    Falls back to raising on unparseable XML so genuine corruption still surfaces.
+    """
+    ET.register_namespace("", _MDAPI_NS)
+    root_a = ET.fromstring(existing)
+    root_b = ET.fromstring(incoming)
+
+    seen = {_child_key(c) for c in list(root_a)}
+    for child in list(root_b):
+        key = _child_key(child)
+        if key not in seen:
+            root_a.append(child)
+            seen.add(key)
+
+    xml = ET.tostring(root_a, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
+def _is_meta_file(path: str) -> bool:
+    """True for Apex/LWC/Aura meta files that carry an <apiVersion> element."""
+    p = path.lower()
+    return p.endswith("-meta.xml")
+
+
+def _normalize_api_version_in_body(body: str, api_version: str) -> str:
+    """Rewrite any <apiVersion>/<version> element in a meta file to the org's.
+
+    LLM-authored Apex ``.cls-meta.xml`` and LWC ``.js-meta.xml`` files hardcode
+    an apiVersion (often a stale default) that may not match the target org,
+    which causes deploy failures and drives the fix-with-AI error loop. Forcing
+    every meta file to the org's real API version at build time makes deploys
+    deterministic regardless of what the model emitted.
+    """
+    return _API_VERSION_RE.sub(
+        lambda m: f"{m.group(1)}{api_version}{m.group(3)}", body
+    )
+
+
+def _wl_find(wl: ET.Element, tag: str) -> ET.Element | None:
+    el = wl.find(f"{{{_MDAPI_NS}}}{tag}")
+    return el if el is not None else wl.find(tag)
+
+
+def _sanitize_object_weblinks(body: str) -> str:
+    """Correct WebLinks inside a CustomObject body so they deploy.
+
+    The LLM emits WebLinks (custom buttons/links) that fail deploy in two
+    recurring, mechanical ways; both are fixed deterministically here so they
+    never reach the org or drive the fix-with-AI loop:
+
+    * ``<position>`` is present when ``openType`` is ``replace`` or
+      ``onClickJavaScript`` — Salesforce rejects this with *"Field Position must
+      not be specified for web links if the open type is Replace or On Click
+      JavaScript"*. The element is stripped.
+    * A URL WebLink omits ``<encodingKey>`` — Salesforce rejects it with
+      *"encodingKey must be specified"*. A default ``UTF-8`` is injected.
+
+    Each WebLink's children are then ordered alphabetically by tag, matching how
+    Salesforce itself serializes retrieved metadata, so inserting elements never
+    produces an out-of-order document.
+
+    Operates on CustomObject bodies (``objects/*.object``). Returns the body
+    unchanged if it does not parse or contains no WebLinks.
+    """
+    if "webLinks" not in body:
+        return body
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body
+
+    ns = f"{{{_MDAPI_NS}}}"
+    changed = False
+    for wl in root.findall(f"{ns}webLinks") + root.findall("webLinks"):
+        open_el = _wl_find(wl, "openType")
+        open_type = (open_el.text or "").strip().lower() if open_el is not None else ""
+        link_el = _wl_find(wl, "linkType")
+        link_type = (link_el.text or "").strip().lower() if link_el is not None else ""
+
+        # Drop <position> where the openType forbids it.
+        if open_type in ("replace", "onclickjavascript"):
+            for pos in wl.findall(f"{ns}position") + wl.findall("position"):
+                wl.remove(pos)
+                changed = True
+
+        # Ensure a URL WebLink has an encodingKey.
+        if link_type == "url" and _wl_find(wl, "encodingKey") is None:
+            ek = ET.SubElement(wl, f"{ns}encodingKey")
+            ek.text = "UTF-8"
+            changed = True
+
+        # Order children alphabetically (Salesforce's own retrieval order) so
+        # any inserted element sits in a schema-valid position.
+        kids = list(wl)
+        ordered = sorted(kids, key=lambda e: e.tag.split("}")[-1])
+        if ordered != kids:
+            for k in kids:
+                wl.remove(k)
+            wl.extend(ordered)
+            changed = True
+
+    if not changed:
+        return body
+    ET.register_namespace("", _MDAPI_NS)
+    xml = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
+def _flow_find(parent: ET.Element, tag: str) -> ET.Element | None:
+    el = parent.find(f"{{{_MDAPI_NS}}}{tag}")
+    return el if el is not None else parent.find(tag)
+
+
+def _upgrade_flow_start(root: ET.Element) -> bool:
+    """Convert a legacy ``<startElementReference>`` into a modern ``<start>``.
+
+    Newer API versions require a ``<start>`` element that carries its own
+    ``<locationX>``/``<locationY>`` and a ``<connector>`` to the first element.
+    Older LLM-authored flows use ``<startElementReference>TargetName</...>``,
+    which deploys at those versions with *"Required field is missing: locationX"*
+    (the missing coordinate belongs to the absent ``<start>``). This rewrites the
+    legacy pointer into a proper ``<start>`` so the flow deploys.
+
+    Returns True if the document was modified.
+    """
+    ns = f"{{{_MDAPI_NS}}}"
+    # Already has a modern <start>: nothing to do.
+    if _flow_find(root, "start") is not None:
+        return False
+    ref = _flow_find(root, "startElementReference")
+    if ref is None or not (ref.text and ref.text.strip()):
+        return False
+    target = ref.text.strip()
+
+    root.remove(ref)
+    start = ET.SubElement(root, f"{ns}start")
+    lx = ET.SubElement(start, f"{ns}locationX")
+    lx.text = "50"
+    ly = ET.SubElement(start, f"{ns}locationY")
+    ly.text = "0"
+    conn = ET.SubElement(start, f"{ns}connector")
+    tgt = ET.SubElement(conn, f"{ns}targetReference")
+    tgt.text = target
+    return True
+
+
+def _reorder_flow_elements(body: str) -> str:
+    """Normalize a Flow so it deploys: modern ``<start>`` + ordered children.
+
+    Two deterministic, recurring LLM mistakes are corrected:
+
+    * A legacy ``<startElementReference>`` (no ``<start>``) fails on newer API
+      versions with *"Required field is missing: locationX"*. It is upgraded to a
+      ``<start>`` element with coordinates and a connector.
+    * Interleaved element collections — e.g. ``screens`` … ``recordCreates`` …
+      ``screens`` — fail with *"Element screens is duplicated at this location in
+      type Flow"*. The Flow schema is an ``xsd:sequence``; sorting the direct
+      children of ``<Flow>`` alphabetically by local tag reproduces the order
+      Salesforce emits on retrieval, so the document becomes schema-valid.
+
+    Returns the body unchanged if it does not parse or is not a Flow.
+    """
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body
+    if root.tag.split("}")[-1] != "Flow":
+        return body
+
+    changed = _upgrade_flow_start(root)
+
+    kids = list(root)
+    ordered = sorted(kids, key=lambda e: e.tag.split("}")[-1])
+    if ordered != kids:
+        for k in kids:
+            root.remove(k)
+        root.extend(ordered)
+        changed = True
+
+    if not changed:
+        return body
+    ET.register_namespace("", _MDAPI_NS)
+    xml = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
+def _sanitize_custom_tab(body: str) -> str:
+    """Remove the invalid ``<sobjectName>`` from a custom-object CustomTab.
+
+    A tab for a custom object is declared with ``<customObject>true</...>``; the
+    object it belongs to is taken from the tab's fullName (the file/member name),
+    NOT from an ``<sobjectName>`` element — which does not exist on CustomTab and
+    fails with *"Element sobjectName invalid at this location in type
+    CustomTab"*. The LLM adds it anyway; strip it so the tab deploys (and so a
+    permission set's tabSettings reference to it resolves).
+
+    Returns the body unchanged if it does not parse or has no such element.
+    """
+    if "sobjectName" not in body:
+        return body
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body
+    if root.tag.split("}")[-1] != "CustomTab":
+        return body
+
+    ns = f"{{{_MDAPI_NS}}}"
+    removed = False
+    for el in root.findall(f"{ns}sobjectName") + root.findall("sobjectName"):
+        root.remove(el)
+        removed = True
+    if not removed:
+        return body
+    ET.register_namespace("", _MDAPI_NS)
+    xml = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
+def _sanitize_flexipage_identifiers(body: str) -> str:
+    """Ensure every FlexiPage ``<componentInstance>`` has an ``<identifier>``.
+
+    Each component placed on a Lightning page needs a unique ``<identifier>``;
+    without it the deploy fails with *"The 'c:foo' component instance doesn't
+    have an identifier specified."*. The LLM routinely omits it. This injects a
+    deterministic unique identifier derived from the component name so the page
+    deploys.
+
+    Returns the body unchanged if it does not parse or is not a FlexiPage.
+    """
+    if "componentInstance" not in body:
+        return body
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body
+    if root.tag.split("}")[-1] != "FlexiPage":
+        return body
+
+    ns = f"{{{_MDAPI_NS}}}"
+    changed = False
+    seen: set[str] = set()
+    for i, ci in enumerate(root.iter(f"{ns}componentInstance")):
+        existing = ci.find(f"{ns}identifier")
+        if existing is None:
+            existing = ci.find("identifier")
+        if existing is not None and existing.text and existing.text.strip():
+            seen.add(existing.text.strip())
+            continue
+        name_el = ci.find(f"{ns}componentName")
+        if name_el is None:
+            name_el = ci.find("componentName")
+        base = (name_el.text or "component").strip() if name_el is not None else "component"
+        # Derive a valid identifier: strip namespace, keep alnum, ensure unique.
+        stem = "".join(c for c in base.split(":")[-1] if c.isalnum()) or "component"
+        ident = f"{stem}{i}"
+        while ident in seen:
+            i += 1
+            ident = f"{stem}{i}"
+        seen.add(ident)
+        # componentInstance requires identifier to precede componentName in the
+        # schema; insert it as the first child.
+        id_el = ET.Element(f"{ns}identifier")
+        id_el.text = ident
+        ci.insert(0, id_el)
+        changed = True
+
+    if not changed:
+        return body
+    ET.register_namespace("", _MDAPI_NS)
+    xml = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
+def _resolve_api_version(plan: Plan, api_version: str) -> str:
+    """Pick the API version for the package.
+
+    The caller-provided ``api_version`` (the org's real version, when known) is
+    authoritative. Only when it is the built-in default do we fall back to the
+    first artifact-specified version, so an explicitly passed org version always
+    wins over whatever the LLM wrote.
+    """
+    if api_version and api_version != DEFAULT_API_VERSION:
+        return api_version
+    for step in plan.steps:
+        if step.metadata_artifact and step.metadata_artifact.api_version:
+            return step.metadata_artifact.api_version
+    return api_version
+
+
 def build_package_xml(plan: Plan, api_version: str = DEFAULT_API_VERSION) -> str:
     """Render a package.xml from the merged members of all steps.
 
-    api_version resolution: the first step artifact that specifies an
-    ``api_version`` wins; otherwise the provided default is used.
+    ``api_version`` is the org's real API version when known; it wins over any
+    artifact-specified version so the package always targets the org's version.
     """
-    for step in plan.steps:
-        if step.metadata_artifact and step.metadata_artifact.api_version:
-            api_version = step.metadata_artifact.api_version
-            break
+    api_version = _resolve_api_version(plan, api_version)
 
     by_type = _collect_members(plan)
     lines = ['<?xml version="1.0" encoding="UTF-8"?>']
@@ -93,6 +432,7 @@ def build_package_zip(
     Raises NoDeployableMetadataError if no step carries a metadata_artifact.
     Raises ValueError on duplicate or empty file paths.
     """
+    resolved_version = _resolve_api_version(plan, api_version)
     file_map: dict[str, str] = {}
     steps_included: list[int] = []
 
@@ -111,11 +451,61 @@ def build_package_zip(
                 raise ValueError(
                     "Steps must not provide package.xml; it is generated."
                 )
-            if path in file_map and file_map[path] != f.body:
+            # Binary artifacts (e.g. a zipped StaticResource) carry base64 bytes
+            # and must bypass every text transform/merge below — those would
+            # corrupt the payload. Decode and store the raw bytes directly.
+            if f.is_binary:
+                try:
+                    raw = base64.b64decode(f.body_base64 or "", validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise ValueError(
+                        f"Step {step.step_number} file '{path}' has invalid "
+                        f"base64 content: {exc}"
+                    )
+                if path in file_map and file_map[path] != raw:
+                    raise ValueError(
+                        f"Conflicting content for metadata file '{path}' across steps."
+                    )
+                file_map[path] = raw
+                continue
+            body = f.body
+            # Force Apex/LWC meta files to the org's API version so a stale or
+            # inconsistent LLM-authored apiVersion never fails the deploy.
+            if _is_meta_file(path):
+                body = _normalize_api_version_in_body(body, resolved_version)
+            # Correct WebLinks (drop illegal <position>, inject required
+            # <encodingKey>) inside object files, which carry WebLinks inline.
+            lpath = path.lower()
+            if _is_mergeable(path):
+                body = _sanitize_object_weblinks(body)
+            # Reorder Flow child elements so interleaved collections (a common
+            # LLM mistake) don't fail with "Element X is duplicated".
+            elif lpath.endswith((".flow", ".flow-meta.xml")):
+                body = _reorder_flow_elements(body)
+            # Strip the invalid <sobjectName> from a custom-object CustomTab.
+            elif lpath.endswith((".tab", ".tab-meta.xml")):
+                body = _sanitize_custom_tab(body)
+            # Inject required <identifier> on FlexiPage component instances.
+            elif lpath.endswith((".flexipage", ".flexipage-meta.xml")):
+                body = _sanitize_flexipage_identifiers(body)
+            if path in file_map and file_map[path] != body:
+                # Aggregate metadata (e.g. a CustomObject holding both a new
+                # field and a new validation rule from different steps) must be
+                # merged into one file, not rejected — the object file must carry
+                # every member or the deploy drops one.
+                if _is_mergeable(path):
+                    try:
+                        file_map[path] = _merge_object_xml(file_map[path], body)
+                        continue
+                    except ET.ParseError as exc:
+                        raise ValueError(
+                            f"Could not merge metadata file '{path}' across "
+                            f"steps: {exc}"
+                        )
                 raise ValueError(
                     f"Conflicting content for metadata file '{path}' across steps."
                 )
-            file_map[path] = f.body
+            file_map[path] = body
 
     if not file_map:
         raise NoDeployableMetadataError(
@@ -137,6 +527,84 @@ def build_package_zip(
         file_paths=sorted(file_map.keys()),
         steps_included=sorted(steps_included),
     )
+
+
+def filter_plan_for_deploy(
+    plan: Plan,
+    step_numbers: list[int] | None = None,
+    artifact_paths: list[str] | None = None,
+) -> Plan:
+    """Return a deep copy of ``plan`` narrowed to a user-selected subset.
+
+    Selection is applied to each step's ``metadata_artifact``:
+
+    * ``step_numbers`` (when not None): steps whose number is absent have their
+      artifact removed entirely, so they contribute no files/members.
+    * ``artifact_paths`` (when not None): within the remaining steps, only files
+      whose path is in the set are kept. Package members are then pruned to the
+      metadata types that still have at least one backing file in that step, so
+      package.xml never lists a type with no deployable file.
+
+    Passing ``None`` for a dimension means "no filtering on that dimension".
+    Passing an empty list means "select nothing" for that dimension. The input
+    plan is not mutated.
+    """
+    filtered = plan.model_copy(deep=True)
+    step_set = set(step_numbers) if step_numbers is not None else None
+    path_set = set(artifact_paths) if artifact_paths is not None else None
+
+    def _norm(p: str) -> str:
+        return p.strip().lstrip("/")
+
+    for step in filtered.steps:
+        art = step.metadata_artifact
+        if not art:
+            continue
+        if step_set is not None and step.step_number not in step_set:
+            step.metadata_artifact = None
+            continue
+        if path_set is not None:
+            kept_files = [f for f in art.files if _norm(f.path) in path_set]
+            art.files = kept_files
+            # Prune members to types that still have a backing file. File paths
+            # follow "<folder>/<Name>.<ext>"; the folder maps to a metadata type
+            # only loosely, so we key on whether ANY file references the member
+            # fullName, falling back to keeping members whose type still has
+            # files at all.
+            remaining_names = {
+                _file_stem(f.path) for f in kept_files
+            }
+            pruned = []
+            for m in art.members:
+                if m.name in remaining_names or _member_has_file(m, kept_files):
+                    pruned.append(m)
+            art.members = pruned
+    return filtered
+
+
+def _file_stem(path: str) -> str:
+    """Best-effort component fullName from a file path (strip dir + extensions)."""
+    base = path.strip().lstrip("/").split("/")[-1]
+    # Strip known compound extensions first (e.g. .layout-meta.xml, .object-meta.xml).
+    for ext in (
+        "-meta.xml",
+    ):
+        if base.endswith(ext):
+            base = base[: -len(ext)]
+    # Strip the remaining single extension.
+    if "." in base:
+        base = base.rsplit(".", 1)[0]
+    return base
+
+
+def _member_has_file(member, files) -> bool:
+    """True if any kept file path plausibly backs this member (by fullName)."""
+    name = member.name
+    for f in files:
+        stem = _file_stem(f.path)
+        if stem == name or name.endswith(stem) or stem.endswith(name):
+            return True
+    return False
 
 
 def _normalize_status(raw: dict) -> dict:

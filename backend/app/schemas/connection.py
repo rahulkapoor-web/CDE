@@ -3,7 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-ConnType = Literal["jira", "github", "salesforce"]
+ConnType = Literal["jira", "github", "salesforce", "checklist"]
 
 
 class ConnectionCreate(BaseModel):

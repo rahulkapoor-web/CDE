@@ -1,14 +1,20 @@
 import axios from "axios";
 import type {
   AuthResponse,
+  ChecklistReviewResult,
   Connection,
   ConnType,
+  GithubCommitResult,
+  JiraCommentResult,
   Plan,
   PlanningContext,
   PlanSummary,
 } from "../types";
 
-const api = axios.create({ baseURL: "/api" });
+// Plan generation/refine are long-running (LLM latency, up to a few minutes).
+// Give requests a generous 10-minute ceiling so the client waits for the plan
+// instead of surfacing a false failure while the backend is still working.
+const api = axios.create({ baseURL: "/api", timeout: 600000 });
 
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem("token");
@@ -128,6 +134,23 @@ export const planningApi = {
     const { data } = await api.get<Plan>(`/planning/plans/${id}`);
     return data;
   },
+  async refine(id: number, feedback: string) {
+    const { data } = await api.post<Plan>(`/planning/plans/${id}/refine`, {
+      feedback,
+    });
+    return data;
+  },
+  async refineWithImages(id: number, feedback: string, files: File[]) {
+    const form = new FormData();
+    form.set("feedback", feedback);
+    files.forEach((f) => form.append("files", f));
+    const { data } = await api.post<Plan>(
+      `/planning/plans/${id}/refine-with-images`,
+      form,
+      { headers: { "Content-Type": "multipart/form-data" } },
+    );
+    return data;
+  },
   async approve(id: number) {
     const { data } = await api.post<Plan>(`/planning/plans/${id}/approve`);
     return data;
@@ -136,11 +159,56 @@ export const planningApi = {
     id: number,
     salesforceConnectionId: number,
     checkOnly = false,
+    selection?: { step_numbers?: number[]; artifact_paths?: string[] },
   ) {
     const { data } = await api.post<Plan>(`/planning/plans/${id}/deploy`, {
       salesforce_connection_id: salesforceConnectionId,
       check_only: checkOnly,
+      ...(selection?.step_numbers !== undefined
+        ? { step_numbers: selection.step_numbers }
+        : {}),
+      ...(selection?.artifact_paths !== undefined
+        ? { artifact_paths: selection.artifact_paths }
+        : {}),
     });
+    return data;
+  },
+  async commitToGithub(
+    id: number,
+    payload: {
+      github_connection_id: number;
+      repo?: string;
+      branch?: string;
+      base_branch?: string;
+      metadata_format?: string;
+      commit_message?: string;
+    },
+  ) {
+    const { data } = await api.post<GithubCommitResult>(
+      `/planning/plans/${id}/commit-github`,
+      payload,
+    );
+    return data;
+  },
+  async postTestPlanToJira(
+    id: number,
+    jiraConnectionId: number,
+    ticketId?: string,
+  ) {
+    const { data } = await api.post<JiraCommentResult>(
+      `/planning/plans/${id}/post-test-plan-jira`,
+      {
+        jira_connection_id: jiraConnectionId,
+        ...(ticketId ? { ticket_id: ticketId } : {}),
+      },
+    );
+    return data;
+  },
+  async reviewChecklist(id: number, checklistConnectionId: number) {
+    const { data } = await api.post<ChecklistReviewResult>(
+      `/planning/plans/${id}/review-checklist`,
+      { checklist_connection_id: checklistConnectionId },
+    );
     return data;
   },
 };
