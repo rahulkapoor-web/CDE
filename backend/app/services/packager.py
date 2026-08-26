@@ -69,17 +69,30 @@ _META_SUFFIX_FOLDERS = {
 
 @dataclass
 class RepoArtifact:
-    """Files to write to a repo, plus metadata about how they were rendered."""
+    """Files to write to a repo, plus metadata about how they were rendered.
+
+    ``files`` are ``(path, content)`` pairs. For binary artifacts (paths in
+    ``binary_paths``) ``content`` is a base64 string; callers committing to a SCM
+    must encode those blobs as base64 rather than utf-8. Text files carry their
+    literal content.
+    """
 
     fmt: str  # "mdapi" | "sfdx"
     files: list[tuple[str, str]] = field(default_factory=list)
     package_xml: str | None = None  # mdapi only
     members: list[str] = field(default_factory=list)  # "Type:name" for reporting
+    binary_paths: set[str] = field(default_factory=set)
 
 
-def _collect_files(plan: Plan) -> dict[str, str]:
-    """Merge every step's artifact files into {path: body}, like the deployer."""
+def _collect_files(plan: Plan) -> tuple[dict[str, str], set[str]]:
+    """Merge every step's artifact files into {path: content}, like the deployer.
+
+    Returns ``(file_map, binary_paths)``. Binary files (e.g. a zipped
+    StaticResource) contribute their base64 string as content and their path is
+    recorded in ``binary_paths`` so downstream committers encode them correctly.
+    """
     file_map: dict[str, str] = {}
+    binary_paths: set[str] = set()
     for step in plan.steps:
         art = step.metadata_artifact
         if not art or not art.files:
@@ -88,12 +101,15 @@ def _collect_files(plan: Plan) -> dict[str, str]:
             path = f.path.strip().lstrip("/")
             if not path or path == "package.xml":
                 continue
-            if path in file_map and file_map[path] != f.body:
+            content = f.body_base64 if f.is_binary else f.body
+            if path in file_map and file_map[path] != content:
                 raise ValueError(
                     f"Conflicting content for metadata file '{path}' across steps."
                 )
-            file_map[path] = f.body
-    return file_map
+            file_map[path] = content
+            if f.is_binary:
+                binary_paths.add(path)
+    return file_map, binary_paths
 
 
 def _members(plan: Plan) -> list[str]:
@@ -210,7 +226,7 @@ def build_repo_artifact(
     if fmt not in ("mdapi", "sfdx"):
         raise ValueError(f"Unknown metadata format '{fmt}'. Use 'mdapi' or 'sfdx'.")
 
-    file_map = _collect_files(plan)
+    file_map, binary_paths = _collect_files(plan)
     if not file_map:
         raise NoDeployableMetadataError(
             "This plan has no deployable metadata to commit. All steps are "
@@ -222,18 +238,36 @@ def build_repo_artifact(
     if fmt == "mdapi":
         package_xml = build_package_xml(plan, api_version=api_version)
         files = [(f"{MDAPI_ROOT}/package.xml", package_xml)]
+        out_binary: set[str] = set()
         for path, body in sorted(file_map.items()):
-            files.append((f"{MDAPI_ROOT}/{path}", body))
+            out_path = f"{MDAPI_ROOT}/{path}"
+            files.append((out_path, body))
+            if path in binary_paths:
+                out_binary.add(out_path)
         return RepoArtifact(
-            fmt=fmt, files=files, package_xml=package_xml, members=members
+            fmt=fmt,
+            files=files,
+            package_xml=package_xml,
+            members=members,
+            binary_paths=out_binary,
         )
 
     # sfdx source format
     out: dict[str, str] = {}
+    out_binary = set()
     for path, body in file_map.items():
+        # Binary artifacts (e.g. .resource zips) are not decomposed; place them
+        # under the source root unchanged and mark them binary.
+        if path in binary_paths:
+            rel = f"{SFDX_ROOT}/{path}"
+            out[rel] = body
+            out_binary.add(rel)
+            continue
         for rel, content in _to_sfdx_paths(path, body).items():
             if rel in out and out[rel] != content:
                 raise ValueError(f"Conflicting content for source file '{rel}'.")
             out[rel] = content
     files = sorted(out.items())
-    return RepoArtifact(fmt=fmt, files=files, members=members)
+    return RepoArtifact(
+        fmt=fmt, files=files, members=members, binary_paths=out_binary
+    )

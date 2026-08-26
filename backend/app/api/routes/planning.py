@@ -63,7 +63,9 @@ from app.services.deployer import (
     filter_plan_for_deploy,
 )
 from app.services.checklist_review import review_plan_against_checklist
+from app.services.deploy_validation import validate_deployable
 from app.services.layout_merge import resolve_layout_edit
+from app.services import static_resources
 from app.services.packager import build_repo_artifact
 from app.services.target_detection import detect_target_objects
 from app.services.planner import PlanGenerationError, generate_plan, refine_plan
@@ -255,6 +257,61 @@ def _resolve_layout_edits(plan_dict: dict, ctx: PlanningContext) -> dict:
     return plan_dict
 
 
+def _resolve_static_resources(plan_dict: dict) -> dict:
+    """Materialize each step's declarative ``static_resources`` into artifacts.
+
+    The LLM cannot author a binary zipped StaticResource, so it just names known
+    libraries (e.g. ``["pdfjs", "pdflib"]``). Here we replace those names with a
+    server-built ``.resource`` (base64 zip) + ``.resource-meta.xml`` and a
+    StaticResource package member, mirroring how ``layout_edits`` are resolved.
+    Unknown keys are dropped with a warning rather than failing the plan.
+    """
+    steps = plan_dict.get("steps")
+    if not isinstance(steps, list):
+        return plan_dict
+
+    for step in steps:
+        keys = step.get("static_resources") or []
+        if not keys:
+            continue
+        new_files: list[dict] = []
+        new_members: list[dict] = []
+        for raw in keys:
+            key = str(raw).strip()
+            if not static_resources.is_known(key):
+                logger.warning(
+                    "Unknown static resource '%s' requested; skipping. Known: %s",
+                    key,
+                    static_resources.known_keys(),
+                )
+                continue
+            new_files.extend(static_resources.resource_files(key))
+            new_members.append(static_resources.resource_member(key))
+
+        if not new_files:
+            continue
+
+        artifact = step.get("metadata_artifact")
+        if not isinstance(artifact, dict):
+            artifact = {"files": [], "members": [], "api_version": None}
+        artifact.setdefault("files", [])
+        artifact.setdefault("members", [])
+        # Replace any prior files for the same resource paths (idempotent).
+        new_paths = {f["path"] for f in new_files}
+        artifact["files"] = [
+            f for f in artifact["files"] if f.get("path") not in new_paths
+        ] + new_files
+        existing_member_keys = {
+            (m.get("type"), m.get("name")) for m in artifact["members"]
+        }
+        for m in new_members:
+            if (m["type"], m["name"]) not in existing_member_keys:
+                artifact["members"].append(m)
+        step["metadata_artifact"] = artifact
+
+    return plan_dict
+
+
 def _unresolved_layout_names(plan_dict: dict) -> list[str]:
     """Layout fullNames declared in layout_edits that have no deployable file yet."""
     names: list[str] = []
@@ -354,6 +411,7 @@ async def _generate_plan_body(
         provider, ctx, guide_context, images=images
     )
     plan_dict = _resolve_layout_edits(plan_dict, ctx)
+    plan_dict = _resolve_static_resources(plan_dict)
     return plan, plan_dict, provider
 
 
@@ -583,6 +641,7 @@ async def _run_refinement_background(
             return
 
         refined_dict = _resolve_layout_edits(refined_dict, ctx)
+        refined_dict = _resolve_static_resources(refined_dict)
 
         # If the reviewer refines a plan they had already approved (typically to
         # fix a failed deployment), keep it approved so they can redeploy
@@ -809,6 +868,22 @@ async def deploy_approved_plan(
             artifact_paths=payload.artifact_paths,
         )
 
+    # Pre-deploy sanity checks: catch self-inconsistent plans (non-deployable
+    # OmniStudio types, custom objects referenced but never created) BEFORE the
+    # Metadata API rejects the whole package with a wall of cascading errors.
+    # The org's object list lets us treat objects already in the org as present.
+    org_objects = (plan.context_snapshot or {}).get("metadata_objects")
+    deploy_errors = validate_deployable(plan_schema, org_objects)
+    if deploy_errors:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This plan cannot be deployed as-is:\n- "
+                + "\n- ".join(deploy_errors)
+                + "\n\nRefine the plan to fix these, then retry the deploy."
+            ),
+        )
+
     # Fail fast with a clear message if there's nothing to deploy, or if the
     # package can't be assembled (e.g. genuinely conflicting metadata). Surface
     # the reason to the UI instead of an opaque 500.
@@ -950,6 +1025,7 @@ async def commit_plan_to_github(
             branch=branch,
             message=message,
             base_branch=payload.base_branch,
+            binary_paths=artifact.binary_paths,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("GitHub commit failed for plan %s", plan_id)

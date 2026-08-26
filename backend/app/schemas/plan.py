@@ -49,12 +49,23 @@ class MetadataFile(BaseModel):
 
     ``path`` is relative to the package root in classic Metadata API (MDAPI)
     format, e.g. ``objects/HealthCondition.object`` or
-    ``layouts/HealthCondition-Health Condition Layout.layout``. ``body`` is the
-    file's full XML content.
+    ``layouts/HealthCondition-Health Condition Layout.layout``.
+
+    Most files are text: ``body`` carries the full XML/source content. Binary
+    files (e.g. a zipped StaticResource ``.resource``) instead set
+    ``body_base64`` with the base64-encoded bytes; the packager decodes it and
+    skips all text transforms. Exactly one of ``body``/``body_base64`` is set.
+    Binary files are produced server-side (see ``static_resources``), not by the
+    LLM, which cannot emit raw binary in JSON.
     """
 
     path: str
-    body: str
+    body: str = ""
+    body_base64: str | None = None
+
+    @property
+    def is_binary(self) -> bool:
+        return self.body_base64 is not None
 
 
 class MetadataMember(BaseModel):
@@ -122,6 +133,11 @@ class PlanStep(BaseModel):
     # backend using the org's existing layout XML. Preferred over hand-written
     # Layout XML because it can never drop required items like Name.
     layout_edits: list[LayoutEdit] = Field(default_factory=list)
+    # Declarative Static Resource libraries this step needs (registry keys such
+    # as "pdfjs", "pdflib"). The backend materializes each into a zipped
+    # .resource + .resource-meta.xml and adds a StaticResource member. The LLM
+    # must NOT hand-author binary static resources; it just names the library.
+    static_resources: list[str] = Field(default_factory=list)
     acceptance_check: str
     estimated_minutes: int
     automation_feasibility: AutomationFeasibility
@@ -219,5 +235,26 @@ def validate_business_rules(plan: Plan) -> list[str]:
         for n in seq:
             if n not in num_set:
                 errors.append(f"deployment_sequence.{label} references unknown step {n}.")
+
+    # Each artifact file must carry exactly one payload (text or binary).
+    for s in plan.steps:
+        if not s.metadata_artifact:
+            continue
+        for f in s.metadata_artifact.files:
+            has_text = bool(f.body)
+            has_bin = f.body_base64 is not None
+            if has_text and has_bin:
+                errors.append(
+                    f"Step {s.step_number} file '{f.path}' sets both body and "
+                    "body_base64; exactly one is allowed."
+                )
+
+    # Non-deployable metadata types (OmniStudio) fail the entire package. Flag
+    # them here so a refinement is asked to rebuild them as an LWC instead of the
+    # reviewer discovering it only at deploy time. Imported lazily to avoid a
+    # circular import (deploy_validation imports this module).
+    from app.services.deploy_validation import check_non_mdapi_types
+
+    errors.extend(check_non_mdapi_types(plan))
 
     return errors

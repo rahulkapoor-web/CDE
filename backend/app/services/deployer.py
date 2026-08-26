@@ -13,6 +13,8 @@ tested without a live org. The deploy call is isolated in ``deploy_plan``.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import io
 import logging
 import re
@@ -449,6 +451,23 @@ def build_package_zip(
                 raise ValueError(
                     "Steps must not provide package.xml; it is generated."
                 )
+            # Binary artifacts (e.g. a zipped StaticResource) carry base64 bytes
+            # and must bypass every text transform/merge below — those would
+            # corrupt the payload. Decode and store the raw bytes directly.
+            if f.is_binary:
+                try:
+                    raw = base64.b64decode(f.body_base64 or "", validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise ValueError(
+                        f"Step {step.step_number} file '{path}' has invalid "
+                        f"base64 content: {exc}"
+                    )
+                if path in file_map and file_map[path] != raw:
+                    raise ValueError(
+                        f"Conflicting content for metadata file '{path}' across steps."
+                    )
+                file_map[path] = raw
+                continue
             body = f.body
             # Force Apex/LWC meta files to the org's API version so a stale or
             # inconsistent LLM-authored apiVersion never fails the deploy.

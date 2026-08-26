@@ -898,9 +898,12 @@ async def test_commit_to_github_success(client, valid_plan_dict, monkeypatch):
         async def detect_format(self, base):
             return "mdapi"
 
-        async def commit_files(self, files, *, branch, message, base_branch=None):
+        async def commit_files(
+            self, files, *, branch, message, base_branch=None, binary_paths=None
+        ):
             captured["files"] = files
             captured["branch"] = branch
+            captured["binary_paths"] = binary_paths
             return CommitResult(
                 branch=branch,
                 commit_sha="abc1234def",

@@ -124,6 +124,10 @@ Key differences in MDAPI format:
 - Custom fields, validation rules, list views, etc. are NOT separate files. They live INSIDE the object file `objects/<Object>.object` as child elements (`<fields>`, `<validationRules>`, …).
 - File extensions have NO `-meta.xml` suffix: use `objects/Account.object`, `layouts/Account-Account Layout.layout`, `permissionsets/PSL.permissionset`, `classes/MyController.cls` (with a separate `classes/MyController.cls-meta.xml` for Apex only).
 
+**NEVER emit OmniStudio components as deployable metadata.** `OmniScript`, `OmniIntegrationProcedure`, `OmniFlexCard`/`FlexCard`, and `DataRaptor` are NOT standard Metadata API types; listing any of them as a `members` entry fails the ENTIRE package with `Unknown type name '…'` and nothing deploys. When the requirement calls for a guided flow, card UI, or data transform, build it as a **Lightning Web Component (LWC)** — an `lwc/<name>/` bundle (`.js`, `.html`, `.js-meta.xml`, optional `.css`) plus any needed **Static Resource** — which IS deployable. Do not create `omniScripts/…`, `omniIntegrationProcedures/…`, `omniFlexCards/…`, or `dataRaptors/…` files.
+
+**Create every custom object you reference.** If ANY step references a custom object (`__c`) — a `CustomTab` for it, a `Layout` on it, an `<object>`/`<field>` grant in a profile/permission set, or Apex using its type — then a step must also AUTHOR that object as `objects/<Object>.object` with a `CustomObject` member, ordered BEFORE the steps that reference it (via `dependencies`). The only exception is an object that already exists in the connected org (listed in the provided org context). A tab/layout/Apex that names an object the plan never creates fails with `no CustomObject named <Object> found` and cascades to every dependent component.
+
 1. **Deployable configuration/code**. Populate `metadata_artifact`:
    - `files`: one entry per MDAPI file. `body` is the FULL, valid XML/source — complete and deployable, not a snippet or placeholder.
    - `members`: the corresponding package.xml entries. `type` is the Metadata API type; `name` is the fullName. For a custom field, the member is `CustomField` / `Account.Preferred_Pharmacy__c` even though the field lives inside `objects/Account.object`.
@@ -226,6 +230,14 @@ Key differences in MDAPI format:
    </LightningComponentBundle>
    ```
    member: `{ "type": "LightningComponentBundle", "name": "myComponent" }` (ONE member for the whole bundle, name = folder name, not the file names). The folder name, the file base names, and the member name MUST all match exactly (camelCase). Any `@salesforce/schema/Object.Field` import in the JS MUST reference a field that exists in the Org Metadata Snapshot; if the story needs a new field, add an earlier step that creates it and make the LWC step depend on it.
+
+   Third-party JS libraries (Static Resources) — when an LWC needs a bundled library such as PDF.js or pdf-lib, it loads it from a **Static Resource** via `loadScript` / `@salesforce/resourceUrl`. You MUST NOT hand-author the library file (you cannot emit binary, and Lightning Web Security rejects a raw `.js` static resource with "Unsupported MIME type" — it must be a zipped `application/zip` resource). Instead, declare the library on a step so the backend materializes the real zipped resource for you:
+   - Add a **dedicated earlier step** (category `metadata`, target `org`) that creates the Static Resources, with a `static_resources` array naming the libraries, e.g. `"static_resources": ["pdfjs", "pdflib"]`. Do NOT put any hand-written files for these in the step; the backend generates the `.resource` (zip) and `.resource-meta.xml` and adds the `StaticResource` package members.
+   - **Sequence it BEFORE the LWC step** in `deployment_sequence.org_steps` and reference it from the LWC step's `depends_on`. The LWC's `import PDFJS from '@salesforce/resourceUrl/pdfjs'` resolves against what is live in the org, so the resource must deploy first.
+   - Available library keys and what each resource contains:
+     - `pdfjs` → `pdfjs.zip` containing `pdf.min.js` + `pdf.worker.min.js` (PDF.js 2.6.347). Load both: the main script and the worker.
+     - `pdflib` → `pdflib.zip` containing `pdf-lib.min.js` (pdf-lib 1.17.1).
+   - The resource name is the key (alphanumeric, no dots/dashes): reference it in the LWC as `@salesforce/resourceUrl/pdfjs`. Only these known keys are supported; if the story needs a different library, add a manual step describing the upload instead of inventing a key.
 
    Lightning page (FlexiPage) — ONE file `flexipages/My_Record_Page.flexipage-meta.xml`. The element hierarchy is fixed by the FlexiPage schema; using the wrong element name fails with errors like *"Property 'componentInstances' not valid in version X"*. The ONLY valid structure is `flexiPageRegions` → `itemInstances` → `componentInstance` (each singular). There is NO `componentInstances` element:
    ```xml
