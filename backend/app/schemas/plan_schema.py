@@ -108,10 +108,16 @@ PLAN_JSON_SCHEMA: dict = {
                                 "items": {
                                     "type": "object",
                                     "additionalProperties": False,
-                                    "required": ["path", "body"],
+                                    "required": ["path"],
                                     "properties": {
                                         "path": {"type": "string"},
                                         "body": {"type": "string"},
+                                        # Binary files (e.g. a zipped
+                                        # StaticResource) are materialized
+                                        # server-side with base64 bytes.
+                                        "body_base64": {
+                                            "type": ["string", "null"]
+                                        },
                                     },
                                 },
                             },
@@ -155,6 +161,10 @@ PLAN_JSON_SCHEMA: dict = {
                                 },
                             },
                         },
+                    },
+                    "static_resources": {
+                        "type": "array",
+                        "items": {"type": "string"},
                     },
                     "acceptance_check": {"type": "string"},
                     "estimated_minutes": {"type": "integer", "minimum": 0},

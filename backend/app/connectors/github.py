@@ -114,6 +114,7 @@ class GitHubConnector:
         branch: str,
         message: str,
         base_branch: str | None = None,
+        binary_paths: set[str] | None = None,
     ) -> CommitResult:
         """Commit ``files`` to ``branch`` in a single commit via the Git Data API.
 
@@ -121,7 +122,13 @@ class GitHubConnector:
         exist it is created from ``base_branch`` (or the repo default). Existing
         files at the same paths are overwritten in the new commit; other files on
         the branch are preserved (the new tree uses the branch tip as its base).
+
+        Paths listed in ``binary_paths`` carry base64-encoded content and are
+        committed with GitHub's ``base64`` blob encoding; all other files use
+        ``utf-8``. This keeps binary artifacts (e.g. zipped Static Resources)
+        intact instead of corrupting them as text.
         """
+        binary_paths = binary_paths or set()
         if not files:
             raise ValueError("No files to commit.")
 
@@ -161,10 +168,11 @@ class GitHubConnector:
             # Create blobs and assemble a new tree.
             tree_entries = []
             for path, content in files:
+                encoding = "base64" if path in binary_paths else "utf-8"
                 blob_resp = await client.post(
                     f"{API}/repos/{self.repo}/git/blobs",
                     headers=headers,
-                    json={"content": content, "encoding": "utf-8"},
+                    json={"content": content, "encoding": encoding},
                 )
                 blob_resp.raise_for_status()
                 tree_entries.append(

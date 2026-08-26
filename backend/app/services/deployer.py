@@ -13,6 +13,8 @@ tested without a live org. The deploy call is isolated in ``deploy_plan``.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import io
 import logging
 import re
@@ -148,6 +150,242 @@ def _normalize_api_version_in_body(body: str, api_version: str) -> str:
     )
 
 
+def _wl_find(wl: ET.Element, tag: str) -> ET.Element | None:
+    el = wl.find(f"{{{_MDAPI_NS}}}{tag}")
+    return el if el is not None else wl.find(tag)
+
+
+def _sanitize_object_weblinks(body: str) -> str:
+    """Correct WebLinks inside a CustomObject body so they deploy.
+
+    The LLM emits WebLinks (custom buttons/links) that fail deploy in two
+    recurring, mechanical ways; both are fixed deterministically here so they
+    never reach the org or drive the fix-with-AI loop:
+
+    * ``<position>`` is present when ``openType`` is ``replace`` or
+      ``onClickJavaScript`` — Salesforce rejects this with *"Field Position must
+      not be specified for web links if the open type is Replace or On Click
+      JavaScript"*. The element is stripped.
+    * A URL WebLink omits ``<encodingKey>`` — Salesforce rejects it with
+      *"encodingKey must be specified"*. A default ``UTF-8`` is injected.
+
+    Each WebLink's children are then ordered alphabetically by tag, matching how
+    Salesforce itself serializes retrieved metadata, so inserting elements never
+    produces an out-of-order document.
+
+    Operates on CustomObject bodies (``objects/*.object``). Returns the body
+    unchanged if it does not parse or contains no WebLinks.
+    """
+    if "webLinks" not in body:
+        return body
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body
+
+    ns = f"{{{_MDAPI_NS}}}"
+    changed = False
+    for wl in root.findall(f"{ns}webLinks") + root.findall("webLinks"):
+        open_el = _wl_find(wl, "openType")
+        open_type = (open_el.text or "").strip().lower() if open_el is not None else ""
+        link_el = _wl_find(wl, "linkType")
+        link_type = (link_el.text or "").strip().lower() if link_el is not None else ""
+
+        # Drop <position> where the openType forbids it.
+        if open_type in ("replace", "onclickjavascript"):
+            for pos in wl.findall(f"{ns}position") + wl.findall("position"):
+                wl.remove(pos)
+                changed = True
+
+        # Ensure a URL WebLink has an encodingKey.
+        if link_type == "url" and _wl_find(wl, "encodingKey") is None:
+            ek = ET.SubElement(wl, f"{ns}encodingKey")
+            ek.text = "UTF-8"
+            changed = True
+
+        # Order children alphabetically (Salesforce's own retrieval order) so
+        # any inserted element sits in a schema-valid position.
+        kids = list(wl)
+        ordered = sorted(kids, key=lambda e: e.tag.split("}")[-1])
+        if ordered != kids:
+            for k in kids:
+                wl.remove(k)
+            wl.extend(ordered)
+            changed = True
+
+    if not changed:
+        return body
+    ET.register_namespace("", _MDAPI_NS)
+    xml = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
+def _flow_find(parent: ET.Element, tag: str) -> ET.Element | None:
+    el = parent.find(f"{{{_MDAPI_NS}}}{tag}")
+    return el if el is not None else parent.find(tag)
+
+
+def _upgrade_flow_start(root: ET.Element) -> bool:
+    """Convert a legacy ``<startElementReference>`` into a modern ``<start>``.
+
+    Newer API versions require a ``<start>`` element that carries its own
+    ``<locationX>``/``<locationY>`` and a ``<connector>`` to the first element.
+    Older LLM-authored flows use ``<startElementReference>TargetName</...>``,
+    which deploys at those versions with *"Required field is missing: locationX"*
+    (the missing coordinate belongs to the absent ``<start>``). This rewrites the
+    legacy pointer into a proper ``<start>`` so the flow deploys.
+
+    Returns True if the document was modified.
+    """
+    ns = f"{{{_MDAPI_NS}}}"
+    # Already has a modern <start>: nothing to do.
+    if _flow_find(root, "start") is not None:
+        return False
+    ref = _flow_find(root, "startElementReference")
+    if ref is None or not (ref.text and ref.text.strip()):
+        return False
+    target = ref.text.strip()
+
+    root.remove(ref)
+    start = ET.SubElement(root, f"{ns}start")
+    lx = ET.SubElement(start, f"{ns}locationX")
+    lx.text = "50"
+    ly = ET.SubElement(start, f"{ns}locationY")
+    ly.text = "0"
+    conn = ET.SubElement(start, f"{ns}connector")
+    tgt = ET.SubElement(conn, f"{ns}targetReference")
+    tgt.text = target
+    return True
+
+
+def _reorder_flow_elements(body: str) -> str:
+    """Normalize a Flow so it deploys: modern ``<start>`` + ordered children.
+
+    Two deterministic, recurring LLM mistakes are corrected:
+
+    * A legacy ``<startElementReference>`` (no ``<start>``) fails on newer API
+      versions with *"Required field is missing: locationX"*. It is upgraded to a
+      ``<start>`` element with coordinates and a connector.
+    * Interleaved element collections — e.g. ``screens`` … ``recordCreates`` …
+      ``screens`` — fail with *"Element screens is duplicated at this location in
+      type Flow"*. The Flow schema is an ``xsd:sequence``; sorting the direct
+      children of ``<Flow>`` alphabetically by local tag reproduces the order
+      Salesforce emits on retrieval, so the document becomes schema-valid.
+
+    Returns the body unchanged if it does not parse or is not a Flow.
+    """
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body
+    if root.tag.split("}")[-1] != "Flow":
+        return body
+
+    changed = _upgrade_flow_start(root)
+
+    kids = list(root)
+    ordered = sorted(kids, key=lambda e: e.tag.split("}")[-1])
+    if ordered != kids:
+        for k in kids:
+            root.remove(k)
+        root.extend(ordered)
+        changed = True
+
+    if not changed:
+        return body
+    ET.register_namespace("", _MDAPI_NS)
+    xml = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
+def _sanitize_custom_tab(body: str) -> str:
+    """Remove the invalid ``<sobjectName>`` from a custom-object CustomTab.
+
+    A tab for a custom object is declared with ``<customObject>true</...>``; the
+    object it belongs to is taken from the tab's fullName (the file/member name),
+    NOT from an ``<sobjectName>`` element — which does not exist on CustomTab and
+    fails with *"Element sobjectName invalid at this location in type
+    CustomTab"*. The LLM adds it anyway; strip it so the tab deploys (and so a
+    permission set's tabSettings reference to it resolves).
+
+    Returns the body unchanged if it does not parse or has no such element.
+    """
+    if "sobjectName" not in body:
+        return body
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body
+    if root.tag.split("}")[-1] != "CustomTab":
+        return body
+
+    ns = f"{{{_MDAPI_NS}}}"
+    removed = False
+    for el in root.findall(f"{ns}sobjectName") + root.findall("sobjectName"):
+        root.remove(el)
+        removed = True
+    if not removed:
+        return body
+    ET.register_namespace("", _MDAPI_NS)
+    xml = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
+def _sanitize_flexipage_identifiers(body: str) -> str:
+    """Ensure every FlexiPage ``<componentInstance>`` has an ``<identifier>``.
+
+    Each component placed on a Lightning page needs a unique ``<identifier>``;
+    without it the deploy fails with *"The 'c:foo' component instance doesn't
+    have an identifier specified."*. The LLM routinely omits it. This injects a
+    deterministic unique identifier derived from the component name so the page
+    deploys.
+
+    Returns the body unchanged if it does not parse or is not a FlexiPage.
+    """
+    if "componentInstance" not in body:
+        return body
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return body
+    if root.tag.split("}")[-1] != "FlexiPage":
+        return body
+
+    ns = f"{{{_MDAPI_NS}}}"
+    changed = False
+    seen: set[str] = set()
+    for i, ci in enumerate(root.iter(f"{ns}componentInstance")):
+        existing = ci.find(f"{ns}identifier")
+        if existing is None:
+            existing = ci.find("identifier")
+        if existing is not None and existing.text and existing.text.strip():
+            seen.add(existing.text.strip())
+            continue
+        name_el = ci.find(f"{ns}componentName")
+        if name_el is None:
+            name_el = ci.find("componentName")
+        base = (name_el.text or "component").strip() if name_el is not None else "component"
+        # Derive a valid identifier: strip namespace, keep alnum, ensure unique.
+        stem = "".join(c for c in base.split(":")[-1] if c.isalnum()) or "component"
+        ident = f"{stem}{i}"
+        while ident in seen:
+            i += 1
+            ident = f"{stem}{i}"
+        seen.add(ident)
+        # componentInstance requires identifier to precede componentName in the
+        # schema; insert it as the first child.
+        id_el = ET.Element(f"{ns}identifier")
+        id_el.text = ident
+        ci.insert(0, id_el)
+        changed = True
+
+    if not changed:
+        return body
+    ET.register_namespace("", _MDAPI_NS)
+    xml = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + xml
+
+
 def _resolve_api_version(plan: Plan, api_version: str) -> str:
     """Pick the API version for the package.
 
@@ -213,11 +451,43 @@ def build_package_zip(
                 raise ValueError(
                     "Steps must not provide package.xml; it is generated."
                 )
+            # Binary artifacts (e.g. a zipped StaticResource) carry base64 bytes
+            # and must bypass every text transform/merge below — those would
+            # corrupt the payload. Decode and store the raw bytes directly.
+            if f.is_binary:
+                try:
+                    raw = base64.b64decode(f.body_base64 or "", validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise ValueError(
+                        f"Step {step.step_number} file '{path}' has invalid "
+                        f"base64 content: {exc}"
+                    )
+                if path in file_map and file_map[path] != raw:
+                    raise ValueError(
+                        f"Conflicting content for metadata file '{path}' across steps."
+                    )
+                file_map[path] = raw
+                continue
             body = f.body
             # Force Apex/LWC meta files to the org's API version so a stale or
             # inconsistent LLM-authored apiVersion never fails the deploy.
             if _is_meta_file(path):
                 body = _normalize_api_version_in_body(body, resolved_version)
+            # Correct WebLinks (drop illegal <position>, inject required
+            # <encodingKey>) inside object files, which carry WebLinks inline.
+            lpath = path.lower()
+            if _is_mergeable(path):
+                body = _sanitize_object_weblinks(body)
+            # Reorder Flow child elements so interleaved collections (a common
+            # LLM mistake) don't fail with "Element X is duplicated".
+            elif lpath.endswith((".flow", ".flow-meta.xml")):
+                body = _reorder_flow_elements(body)
+            # Strip the invalid <sobjectName> from a custom-object CustomTab.
+            elif lpath.endswith((".tab", ".tab-meta.xml")):
+                body = _sanitize_custom_tab(body)
+            # Inject required <identifier> on FlexiPage component instances.
+            elif lpath.endswith((".flexipage", ".flexipage-meta.xml")):
+                body = _sanitize_flexipage_identifiers(body)
             if path in file_map and file_map[path] != body:
                 # Aggregate metadata (e.g. a CustomObject holding both a new
                 # field and a new validation rule from different steps) must be

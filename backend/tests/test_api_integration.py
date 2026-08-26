@@ -585,6 +585,7 @@ class RefiningProvider(FakeProvider):
         self._second = second
         self._calls = 0
         self.last_refine_prompt = None
+        self.last_refine_images = None
 
     async def complete(self, system_prompt, user_prompt, **kwargs):
         self._calls += 1
@@ -593,6 +594,7 @@ class RefiningProvider(FakeProvider):
                 text=json.dumps(self._plan), model="m", provider=self.name
             )
         self.last_refine_prompt = user_prompt
+        self.last_refine_images = kwargs.get("images")
         return LLMResult(
             text=json.dumps(self._second), model="m", provider=self.name
         )
@@ -642,6 +644,111 @@ async def test_refine_of_generated_plan_stays_generated(
     assert body["plan_json"]["summary"].startswith("Refined:")
     assert "Drop the validation rule" in provider.last_refine_prompt
     assert "CURRENT PLAN JSON" in provider.last_refine_prompt
+
+
+@pytest.mark.asyncio
+async def test_refine_with_images_forwards_screenshot_to_provider(
+    client, valid_plan_dict, monkeypatch
+):
+    """The 'Fix issues' flow: feedback + a screenshot are sent to the AI, the
+    image reaches the provider, and the plan is refined in place."""
+    import copy
+
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    first = _plan_dict_with_artifact(valid_plan_dict)
+    second = copy.deepcopy(first)
+    second["summary"] = "Refined: fixed the broken Classification mapping."
+
+    provider = RefiningProvider(first, second)
+    monkeypatch.setattr(planning_route, "get_llm_provider", lambda: provider)
+
+    plan_id = await _generate_plan(client, headers)
+
+    # Empty feedback is rejected even with an image attached.
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/refine-with-images",
+        headers=headers,
+        data={"feedback": "   "},
+        files=[("files", ("bug.png", _PNG_1x1, "image/png"))],
+    )
+    assert r.status_code == 422
+
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/refine-with-images",
+        headers=headers,
+        data={"feedback": "Classification field is always blank after save."},
+        files=[("files", ("bug.png", _PNG_1x1, "image/png"))],
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "refining"
+
+    body = await _await_refinement(client, headers, plan_id)
+    assert body["status"] == "generated"
+    assert body["plan_json"]["summary"].startswith("Refined:")
+    # The screenshot reached the provider and the feedback is in the prompt.
+    assert provider.last_refine_images is not None
+    assert len(provider.last_refine_images) == 1
+    assert provider.last_refine_images[0].media_type == "image/png"
+    assert provider.last_refine_images[0].data
+    assert "Classification field is always blank" in provider.last_refine_prompt
+
+
+@pytest.mark.asyncio
+async def test_refine_with_images_rejects_bad_type(
+    client, valid_plan_dict, monkeypatch
+):
+    """A non-image upload on the fix-issues endpoint is rejected."""
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    first = _plan_dict_with_artifact(valid_plan_dict)
+    provider = RefiningProvider(first, first)
+    monkeypatch.setattr(planning_route, "get_llm_provider", lambda: provider)
+
+    plan_id = await _generate_plan(client, headers)
+
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/refine-with-images",
+        headers=headers,
+        data={"feedback": "Something is wrong."},
+        files=[("files", ("notes.txt", b"hello", "text/plain"))],
+    )
+    assert r.status_code == 400
+    assert "Unsupported image type" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_refine_with_images_no_files_still_refines(
+    client, valid_plan_dict, monkeypatch
+):
+    """The fix-issues endpoint works with feedback only (no screenshot)."""
+    import copy
+
+    headers = await _register(client)
+    from app.api.routes import planning as planning_route
+
+    first = _plan_dict_with_artifact(valid_plan_dict)
+    second = copy.deepcopy(first)
+    second["summary"] = "Refined: text-only issue fix."
+    provider = RefiningProvider(first, second)
+    monkeypatch.setattr(planning_route, "get_llm_provider", lambda: provider)
+
+    plan_id = await _generate_plan(client, headers)
+
+    r = await client.post(
+        f"/api/planning/plans/{plan_id}/refine-with-images",
+        headers=headers,
+        data={"feedback": "The button label is wrong."},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "refining"
+
+    body = await _await_refinement(client, headers, plan_id)
+    assert body["status"] == "generated"
+    assert body["plan_json"]["summary"].startswith("Refined:")
+    assert provider.last_refine_images is None
 
 
 @pytest.mark.asyncio
@@ -791,9 +898,12 @@ async def test_commit_to_github_success(client, valid_plan_dict, monkeypatch):
         async def detect_format(self, base):
             return "mdapi"
 
-        async def commit_files(self, files, *, branch, message, base_branch=None):
+        async def commit_files(
+            self, files, *, branch, message, base_branch=None, binary_paths=None
+        ):
             captured["files"] = files
             captured["branch"] = branch
+            captured["binary_paths"] = binary_paths
             return CommitResult(
                 branch=branch,
                 commit_sha="abc1234def",

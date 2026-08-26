@@ -20,8 +20,11 @@ import {
   Switch,
   Tag,
   Typography,
+  Upload,
   message,
 } from "antd";
+import type { UploadFile } from "antd";
+import { InboxOutlined, ToolOutlined } from "@ant-design/icons";
 import { useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { connectionsApi, planningApi } from "../services/api";
@@ -40,6 +43,17 @@ import { downloadFile, planToJson, planToMarkdown } from "../utils/download";
 const { TextArea } = Input;
 
 const { Title, Paragraph, Text } = Typography;
+
+// Image constraints for the "Fix issues" screenshot upload. Kept in sync with
+// the backend upload validation (type/size) used by refine-with-images.
+const ACCEPTED_IMAGE_TYPES = [
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+];
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_ISSUE_IMAGES = 4;
 
 function errText(e: unknown, fallback: string): string {
   const anyErr = e as { response?: { data?: { detail?: unknown } } };
@@ -410,6 +424,11 @@ export default function PlanDetailPage() {
   const [feedback, setFeedback] = useState("");
   const [refining, setRefining] = useState(false);
 
+  // "Fix issues" — report a functional problem with optional screenshots.
+  const [fixIssueOpen, setFixIssueOpen] = useState(false);
+  const [issueText, setIssueText] = useState("");
+  const [issueFiles, setIssueFiles] = useState<UploadFile[]>([]);
+
   // GitHub commit path.
   const [ghModalOpen, setGhModalOpen] = useState(false);
   const [committing, setCommitting] = useState(false);
@@ -582,6 +601,42 @@ export default function PlanDetailPage() {
     } finally {
       setRefining(false);
     }
+  };
+
+  // Report a functional issue (deployed behavior is wrong/broken) with an
+  // optional screenshot. Feedback + images are sent to the AI, which refines
+  // the plan in place — distinct from deploy-error fixing, which is grounded in
+  // Salesforce's rejection messages.
+  const runRefineWithImages = async (fb: string, files: File[]) => {
+    if (!plan) return;
+    setRefining(true);
+    try {
+      const updated = files.length
+        ? await planningApi.refineWithImages(plan.id, fb, files)
+        : await planningApi.refine(plan.id, fb);
+      setPlan(updated);
+      setFixIssueOpen(false);
+      setIssueText("");
+      setIssueFiles([]);
+      message.success("Refining plan… this page updates when it's ready.");
+    } catch (e) {
+      message.error(errText(e, "Refinement failed"));
+    } finally {
+      setRefining(false);
+    }
+  };
+
+  const handleFixIssue = async () => {
+    const fb = issueText.trim();
+    if (!fb) {
+      message.warning("Describe the issue so the AI can fix it.");
+      return;
+    }
+    const files = issueFiles
+      .map((f) => f.originFileObj as File | undefined)
+      .filter((f): f is File => Boolean(f));
+    const prefixed = `The deployed functionality has a problem. Fix the plan so it works correctly.\n\nReported issue:\n${fb}`;
+    await runRefineWithImages(prefixed, files);
   };
 
   // Turn the last deployment's structured errors into refine feedback so the AI
@@ -887,6 +942,25 @@ export default function PlanDetailPage() {
             )}
           </div>
         )}
+        {(status === "deployed" || status === "deploy_failed") && (
+          <div style={{ marginTop: 12 }}>
+            <Divider orientation="left" style={{ margin: "8px 0" }}>
+              Something not working right?
+            </Divider>
+            <Paragraph type="secondary" style={{ marginBottom: 8 }}>
+              If the deployed functionality is broken or behaves incorrectly,
+              report the issue and the AI will revise the plan to fix it. You can
+              attach screenshots showing the problem.
+            </Paragraph>
+            <Button
+              icon={<ToolOutlined />}
+              loading={refining}
+              onClick={() => setFixIssueOpen(true)}
+            >
+              Fix issues
+            </Button>
+          </div>
+        )}
         {status !== "deploying" && (
           <div style={{ marginTop: 12 }}>
             <Divider orientation="left" style={{ margin: "8px 0" }}>
@@ -916,6 +990,82 @@ export default function PlanDetailPage() {
           </div>
         )}
       </Card>
+
+      <Modal
+        title="Fix a functional issue"
+        open={fixIssueOpen}
+        onCancel={() => {
+          if (refining) return;
+          setFixIssueOpen(false);
+        }}
+        footer={[
+          <Button
+            key="cancel"
+            disabled={refining}
+            onClick={() => setFixIssueOpen(false)}
+          >
+            Cancel
+          </Button>,
+          <Button
+            key="fix"
+            type="primary"
+            loading={refining}
+            disabled={!issueText.trim()}
+            onClick={handleFixIssue}
+          >
+            Send to AI
+          </Button>,
+        ]}
+      >
+        <Paragraph type="secondary">
+          Describe what's broken or incorrect about the deployed functionality.
+          The AI revises the plan to address it; refining resets the plan to{" "}
+          <Tag>generated</Tag> for re-review and redeploy.
+        </Paragraph>
+        <TextArea
+          rows={5}
+          placeholder="e.g. The New Account Intake flow saves the record but the Classification field is always blank. It should copy the value chosen on the Classification screen."
+          value={issueText}
+          onChange={(e) => setIssueText(e.target.value)}
+          disabled={refining}
+        />
+        <Divider orientation="left" style={{ margin: "12px 0 8px" }}>
+          Screenshots (optional)
+        </Divider>
+        <Upload.Dragger
+          multiple
+          accept={ACCEPTED_IMAGE_TYPES.join(",")}
+          fileList={issueFiles}
+          disabled={refining}
+          beforeUpload={(file) => {
+            if (!ACCEPTED_IMAGE_TYPES.includes(file.type)) {
+              message.error(
+                `${file.name}: unsupported type. Use PNG, JPG, WebP, or GIF.`,
+              );
+              return Upload.LIST_IGNORE as unknown as boolean;
+            }
+            if (file.size > MAX_IMAGE_BYTES) {
+              message.error(`${file.name}: exceeds the 5 MB limit.`);
+              return Upload.LIST_IGNORE as unknown as boolean;
+            }
+            return false;
+          }}
+          onChange={({ fileList }) =>
+            setIssueFiles(fileList.slice(0, MAX_ISSUE_IMAGES))
+          }
+        >
+          <p className="ant-upload-drag-icon">
+            <InboxOutlined />
+          </p>
+          <p className="ant-upload-text">
+            Click or drag screenshots of the problem here
+          </p>
+          <p className="ant-upload-hint">
+            Up to {MAX_ISSUE_IMAGES} images (PNG, JPG, WebP, GIF; max 5 MB each).
+            The AI uses them as visual context.
+          </p>
+        </Upload.Dragger>
+      </Modal>
 
       <Modal
         title="Deploy to Salesforce"

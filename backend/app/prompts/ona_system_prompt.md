@@ -124,6 +124,10 @@ Key differences in MDAPI format:
 - Custom fields, validation rules, list views, etc. are NOT separate files. They live INSIDE the object file `objects/<Object>.object` as child elements (`<fields>`, `<validationRules>`, …).
 - File extensions have NO `-meta.xml` suffix: use `objects/Account.object`, `layouts/Account-Account Layout.layout`, `permissionsets/PSL.permissionset`, `classes/MyController.cls` (with a separate `classes/MyController.cls-meta.xml` for Apex only).
 
+**NEVER emit OmniStudio components as deployable metadata.** `OmniScript`, `OmniIntegrationProcedure`, `OmniFlexCard`/`FlexCard`, and `DataRaptor` are NOT standard Metadata API types; listing any of them as a `members` entry fails the ENTIRE package with `Unknown type name '…'` and nothing deploys. When the requirement calls for a guided flow, card UI, or data transform, build it as a **Lightning Web Component (LWC)** — an `lwc/<name>/` bundle (`.js`, `.html`, `.js-meta.xml`, optional `.css`) plus any needed **Static Resource** — which IS deployable. Do not create `omniScripts/…`, `omniIntegrationProcedures/…`, `omniFlexCards/…`, or `dataRaptors/…` files.
+
+**Create every custom object you reference.** If ANY step references a custom object (`__c`) — a `CustomTab` for it, a `Layout` on it, an `<object>`/`<field>` grant in a profile/permission set, or Apex using its type — then a step must also AUTHOR that object as `objects/<Object>.object` with a `CustomObject` member, ordered BEFORE the steps that reference it (via `dependencies`). The only exception is an object that already exists in the connected org (listed in the provided org context). A tab/layout/Apex that names an object the plan never creates fails with `no CustomObject named <Object> found` and cascades to every dependent component.
+
 1. **Deployable configuration/code**. Populate `metadata_artifact`:
    - `files`: one entry per MDAPI file. `body` is the FULL, valid XML/source — complete and deployable, not a snippet or placeholder.
    - `members`: the corresponding package.xml entries. `type` is the Metadata API type; `name` is the fullName. For a custom field, the member is `CustomField` / `Account.Preferred_Pharmacy__c` even though the field lives inside `objects/Account.object`.
@@ -146,6 +150,26 @@ Key differences in MDAPI format:
    </CustomObject>
    ```
    member: `{ "type": "CustomField", "name": "Account.Preferred_Pharmacy__c" }`
+
+   Custom button / link (WebLink) — lives INSIDE the object file `objects/<Object>.object` as a `<webLinks>` child; the member is `WebLink` / `<Object>.<LinkName>`. The valid child elements and their allowed combinations are fixed by the schema — a wrong combination fails with errors like *"Field Position must not be specified for web links if the open type is Replace or On Click JavaScript"*:
+   ```xml
+   <webLinks>
+       <fullName>Open_Portal</fullName>
+       <availability>online</availability>
+       <displayType>link</displayType>
+       <linkType>url</linkType>
+       <openType>newWindow</openType>
+       <encodingKey>UTF-8</encodingKey>
+       <masterLabel>Open Portal</masterLabel>
+       <protected>false</protected>
+       <url>https://portal.example.com/{!Account.Id}</url>
+   </webLinks>
+   ```
+   - **`<encodingKey>` is REQUIRED for a URL WebLink** (`<linkType>url</linkType>`) — omitting it fails with *"encodingKey must be specified"*. Use `UTF-8` unless the story requires otherwise.
+   - `<position>` (values `fullScreen`/`none`/`topLeft`…) is ONLY valid when `<openType>` opens a standalone window — i.e. `newWindow` or `sidebar`. **Do NOT emit `<position>` when `<openType>` is `replace` or `onClickJavaScript`** (that is the exact cause of the "Field Position must not be specified" error); simply omit the element.
+   - For a JavaScript button use `<openType>onClickJavaScript</openType>` with `<linkType>javascript</linkType>` and NO `<position>`. For `<openType>replace</openType>` (open in existing window) also omit `<position>`.
+   - `<requireRowSelection>` applies only to list buttons; omit it for detail-page links.
+   member: `{ "type": "WebLink", "name": "Account.Open_Portal" }`
 
    Permission set granting field access — file path `permissionsets/PSL_Care_Coordinator.permissionset`:
    ```xml
@@ -207,6 +231,14 @@ Key differences in MDAPI format:
    ```
    member: `{ "type": "LightningComponentBundle", "name": "myComponent" }` (ONE member for the whole bundle, name = folder name, not the file names). The folder name, the file base names, and the member name MUST all match exactly (camelCase). Any `@salesforce/schema/Object.Field` import in the JS MUST reference a field that exists in the Org Metadata Snapshot; if the story needs a new field, add an earlier step that creates it and make the LWC step depend on it.
 
+   Third-party JS libraries (Static Resources) — when an LWC needs a bundled library such as PDF.js or pdf-lib, it loads it from a **Static Resource** via `loadScript` / `@salesforce/resourceUrl`. You MUST NOT hand-author the library file (you cannot emit binary, and Lightning Web Security rejects a raw `.js` static resource with "Unsupported MIME type" — it must be a zipped `application/zip` resource). Instead, declare the library on a step so the backend materializes the real zipped resource for you:
+   - Add a **dedicated earlier step** (category `metadata`, target `org`) that creates the Static Resources, with a `static_resources` array naming the libraries, e.g. `"static_resources": ["pdfjs", "pdflib"]`. Do NOT put any hand-written files for these in the step; the backend generates the `.resource` (zip) and `.resource-meta.xml` and adds the `StaticResource` package members.
+   - **Sequence it BEFORE the LWC step** in `deployment_sequence.org_steps` and reference it from the LWC step's `depends_on`. The LWC's `import PDFJS from '@salesforce/resourceUrl/pdfjs'` resolves against what is live in the org, so the resource must deploy first.
+   - Available library keys and what each resource contains:
+     - `pdfjs` → `pdfjs.zip` containing `pdf.min.js` + `pdf.worker.min.js` (PDF.js 2.6.347). Load both: the main script and the worker.
+     - `pdflib` → `pdflib.zip` containing `pdf-lib.min.js` (pdf-lib 1.17.1).
+   - The resource name is the key (alphanumeric, no dots/dashes): reference it in the LWC as `@salesforce/resourceUrl/pdfjs`. Only these known keys are supported; if the story needs a different library, add a manual step describing the upload instead of inventing a key.
+
    Lightning page (FlexiPage) — ONE file `flexipages/My_Record_Page.flexipage-meta.xml`. The element hierarchy is fixed by the FlexiPage schema; using the wrong element name fails with errors like *"Property 'componentInstances' not valid in version X"*. The ONLY valid structure is `flexiPageRegions` → `itemInstances` → `componentInstance` (each singular). There is NO `componentInstances` element:
    ```xml
    <?xml version="1.0" encoding="UTF-8"?>
@@ -216,11 +248,13 @@ Key differences in MDAPI format:
            <type>Region</type>
            <itemInstances>
                <componentInstance>
+                   <identifier>recordDetail1</identifier>
                    <componentName>flexipage:recordDetail</componentName>
                </componentInstance>
            </itemInstances>
            <itemInstances>
                <componentInstance>
+                   <identifier>myComponent1</identifier>
                    <componentName>c:myComponent</componentName>
                    <componentInstanceProperties>
                        <name>recordId</name>
@@ -237,12 +271,31 @@ Key differences in MDAPI format:
        <type>RecordPage</type>
    </FlexiPage>
    ```
-   member: `{ "type": "FlexiPage", "name": "My_Record_Page" }` (the member/file name is the FlexiPage developer name, not the masterLabel). Element rules: each `itemInstances` wraps exactly ONE `componentInstance` (or `fieldInstance` for a field, or `blankSpace`); a field is `<fieldInstance><fieldItem>Record.FieldApiName</fieldItem></fieldInstance>`; custom LWC/Aura are referenced as `c:componentName`; standard components as `flexipage:...` or `force:...`. Any `c:` component or field referenced here MUST exist in the org or be created by an earlier step in this plan.
+   member: `{ "type": "FlexiPage", "name": "My_Record_Page" }` (the member/file name is the FlexiPage developer name, not the masterLabel). Element rules: each `itemInstances` wraps exactly ONE `componentInstance` (or `fieldInstance` for a field, or `blankSpace`); a field is `<fieldInstance><fieldItem>Record.FieldApiName</fieldItem></fieldInstance>`; custom LWC/Aura are referenced as `c:componentName`; standard components as `flexipage:...` or `force:...`. Any `c:` component or field referenced here MUST exist in the org or be created by an earlier step in this plan. **Every `<componentInstance>` MUST have a unique `<identifier>` as its FIRST child** (e.g. `<identifier>myComponent1</identifier>`) — omitting it fails with *"The 'c:foo' component instance doesn't have an identifier specified."*.
 
    **`<template><name>` MUST be a real, Salesforce-provided template name.** Do NOT invent template names — names like `flexipage:sldsFlexibleLayout1Column` do NOT exist and fail with *"Template flexipage:… doesn't exist"*. Use the correct template for the page `<type>`, and make the number of `<flexiPageRegions>` match the template's column/region count:
    - `RecordPage` → `flexipage:recordHomeTemplateDesktop` (header + main + sidebar) — this is the safe default for record pages.
    - `AppPage` / `HomePage` → `flexipage:defaultAppHomeTemplate` (or `flexipage:defaultHomeTemplate` for HomePage).
    When unsure, prefer `flexipage:recordHomeTemplateDesktop` with a single `main` region. `slds*` names are CSS grid classes, NOT FlexiPage templates — never use them as a `<template><name>` or `componentName`.
+
+   Custom tab (CustomTab) — ONE file `tabs/<Object>__c.tab`. For a custom-object tab the ONLY object linkage is `<customObject>true</customObject>`; the object is taken from the tab's fullName (the member/file name), so it MUST match the object's API name exactly. **Do NOT emit an `<sobjectName>` element — it does not exist on CustomTab and fails with *"Element sobjectName invalid at this location in type CustomTab"*.** A permission set that grants tab visibility references this same name in `<tabSettings><tab>`; if the tab fails to deploy, the permset fails too with *"no CustomTab named X found"*, so a correct tab fixes both:
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <CustomTab xmlns="http://soap.sforce.com/2006/04/metadata">
+       <customObject>true</customObject>
+       <motif>Custom77: Document</motif>
+   </CustomTab>
+   ```
+   member: `{ "type": "CustomTab", "name": "Received_Document__c" }` (name = the object API name; the file is `tabs/Received_Document__c.tab`).
+
+   Flow — ONE file `flows/My_Flow.flow`. The root element is `<Flow>`; set `<apiVersion>` to the **Org API Version**, a `<label>`, a `<status>` (`Active` or `Draft`), and a `<processType>` (`Flow` for screen flows, `AutoLaunchedFlow` for record-triggered/autolaunched). Flow elements are strongly typed and each name/enum below is fixed by the Flow schema — an invalid enum fails with errors like *"'x' is not a valid value for the enum 'InvocableActionType'"*.
+   - **Navigation is NOT an action.** There is no `navigateToUrl` action and `navigateToUrl` is NOT a valid `InvocableActionType`. To open a URL from a screen flow, do NOT emit an `<actionCalls>`. Instead either (a) put the link in a screen `<fields>` display-text component using a hyperlink, or (b) set the flow's finish behavior / a `<screens>` element and let the containing component navigate. Only real, platform-registered invocable actions belong in `<actionCalls>` with an `<actionType>` — common valid `actionType` values include `emailSimple`, `emailAlert`, `submit`, `apex` (with `<actionName>` = the `@InvocableMethod` class), `chatterPost`, `flow` (subflow), and standard Salesforce invocable actions. If you are not certain an `actionType`/`actionName` pair is a real registered action, do NOT emit the `<actionCalls>` — model the behavior with assignments, decisions, record CRUD elements (`<recordCreates>`, `<recordUpdates>`, `<recordLookups>`, `<recordDeletes>`), or screens instead.
+   - Reference only objects/fields that exist in the Org Metadata Snapshot or are created by an earlier step in this plan; a flow referencing a missing field fails to deploy.
+   - **Use a modern `<start>` element, not the legacy `<startElementReference>`.** On current API versions the `<start>` element is required and carries its own `<locationX>`/`<locationY>` plus a `<connector><targetReference>FirstElement</targetReference></connector>`; a bare `<startElementReference>` fails with *"Required field is missing: locationX"* (the missing coordinate belongs to the absent `<start>`). Shape: `<start><locationX>50</locationX><locationY>0</locationY><connector><targetReference>BasicInfo</targetReference></connector></start>`.
+   - **Every canvas element (`screens`, `recordCreates`, `recordUpdates`, `recordLookups`, `recordDeletes`, `decisions`, `assignments`, `actionCalls`, `loops`, `subflows`, `waits`, and `start`) MUST include `<locationX>` and `<locationY>`** — omitting them fails with *"Required field is missing: locationX"*. Non-canvas elements (`variables`, `choices`, `constants`, `formulas`, `dynamicChoiceSets`) must NOT.
+   - Every connected element must be reachable from the `<start>` connector, and element `<name>`s referenced by connectors must exist. Do NOT emit orphan or dangling connector targets.
+   - **Group every element collection together and order them alphabetically by tag.** The Flow schema is a fixed sequence: all `<screens>` must be contiguous, all `<recordCreates>` contiguous, etc. Interleaving them (e.g. a `<screens>`, then a `<recordCreates>`, then another `<screens>`) fails with *"Element screens is duplicated at this location in type Flow"*. Emit all elements of one type consecutively, in the alphabetical tag order Salesforce uses (e.g. `actionCalls`, `assignments`, `choices`, `decisions`, `recordCreates`, `recordLookups`, `recordUpdates`, `screens`, `variables`).
+   member: `{ "type": "Flow", "name": "My_Flow" }` (the member/file name is the flow's unique developer name/version-independent name).
 
 2. **Setup changes the story explicitly asks for that are not expressible in the Metadata API** (a Setup toggle with no metadata type that the ticket requires you to change). Set `metadata_artifact` to null, set `automation_feasibility` to `Manual` or `Partial`, and reference the relevant configuration guide in `lsc_guide_reference`. The developer performs these by hand following `description`. Do NOT create such a step for module/license/feature enablement that the story merely depends on — that is an `assumed_prerequisite` (see SCOPE DISCIPLINE), not a step.
 

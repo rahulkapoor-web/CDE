@@ -188,6 +188,281 @@ def test_duplicate_object_member_is_deduped(valid_plan_dict):
     assert merged.count("<fullName>Foo__c</fullName>") == 1
 
 
+def _weblink_object(open_type: str, with_position: bool) -> str:
+    pos = "    <position>topLeft</position>\n" if with_position else ""
+    return _object_file(
+        "  <webLinks>\n"
+        "    <fullName>Open_Portal</fullName>\n"
+        f"    <openType>{open_type}</openType>\n"
+        f"{pos}"
+        "    <linkType>url</linkType>\n"
+        "    <masterLabel>Open Portal</masterLabel>\n"
+        "    <url>https://example.com</url>\n"
+        "  </webLinks>"
+    )
+
+
+@pytest.mark.parametrize("open_type", ["replace", "onClickJavaScript"])
+def test_weblink_position_stripped_for_forbidden_open_types(
+    valid_plan_dict, open_type
+):
+    """A WebLink with openType replace/onClickJavaScript must have <position>
+    removed at build time — Salesforce rejects the combination."""
+    data = copy.deepcopy(valid_plan_dict)
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {
+                "path": "objects/Account.object",
+                "body": _weblink_object(open_type, with_position=True),
+            }
+        ],
+        "members": [{"type": "WebLink", "name": "Account.Open_Portal"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["objects/Account.object"]
+    assert "<position>" not in built
+    # The rest of the WebLink is preserved.
+    assert "Open_Portal" in built
+    assert f"<openType>{open_type}</openType>" in built
+
+
+def test_weblink_position_kept_for_new_window(valid_plan_dict):
+    """A WebLink that opens a standalone window may keep its <position>."""
+    data = copy.deepcopy(valid_plan_dict)
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {
+                "path": "objects/Account.object",
+                "body": _weblink_object("newWindow", with_position=True),
+            }
+        ],
+        "members": [{"type": "WebLink", "name": "Account.Open_Portal"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["objects/Account.object"]
+    assert "<position>topLeft</position>" in built
+
+
+def test_weblink_missing_encoding_key_is_injected(valid_plan_dict):
+    """A URL WebLink without <encodingKey> gets a UTF-8 default at build time —
+    Salesforce rejects it otherwise with 'encodingKey must be specified'."""
+    data = copy.deepcopy(valid_plan_dict)
+    # _weblink_object emits a url linkType and no encodingKey.
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {
+                "path": "objects/Account.object",
+                "body": _weblink_object("replace", with_position=False),
+            }
+        ],
+        "members": [{"type": "WebLink", "name": "Account.Open_Portal"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["objects/Account.object"]
+    assert "<encodingKey>UTF-8</encodingKey>" in built
+
+
+def _flow_body(elements_xml: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "    <apiVersion>60.0</apiVersion>\n"
+        "    <label>My Flow</label>\n"
+        "    <processType>Flow</processType>\n"
+        "    <status>Active</status>\n"
+        f"{elements_xml}\n"
+        "</Flow>\n"
+    )
+
+
+def test_flow_interleaved_screens_are_grouped(valid_plan_dict):
+    """Interleaved <screens>/<recordCreates>/<screens> must be reordered so the
+    screens are contiguous, avoiding 'Element screens is duplicated'."""
+    data = copy.deepcopy(valid_plan_dict)
+    body = _flow_body(
+        "    <screens><name>ScreenA</name></screens>\n"
+        "    <recordCreates><name>CreateRec</name></recordCreates>\n"
+        "    <screens><name>ScreenB</name></screens>"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "flows/New_Account_Intake.flow", "body": body}],
+        "members": [{"type": "Flow", "name": "New_Account_Intake"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["flows/New_Account_Intake.flow"]
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://soap.sforce.com/2006/04/metadata}"
+    root = ET.fromstring(built)
+    tags = [c.tag.replace(ns, "") for c in root]
+    screen_idx = [i for i, t in enumerate(tags) if t == "screens"]
+    # Both screens survive and are now contiguous.
+    assert len(screen_idx) == 2
+    assert screen_idx == list(range(screen_idx[0], screen_idx[0] + 2))
+    assert "ScreenA" in built and "ScreenB" in built and "CreateRec" in built
+
+
+def test_flow_legacy_start_reference_upgraded_to_start(valid_plan_dict):
+    """A legacy <startElementReference> is rewritten to a modern <start> with
+    coordinates and a connector, avoiding 'Required field is missing: locationX'.
+    """
+    data = copy.deepcopy(valid_plan_dict)
+    body = _flow_body(
+        "    <startElementReference>BasicInfo</startElementReference>\n"
+        "    <screens><name>BasicInfo</name>"
+        "<locationX>176</locationX><locationY>134</locationY></screens>"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "flows/New_Account_Intake.flow", "body": body}],
+        "members": [{"type": "Flow", "name": "New_Account_Intake"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["flows/New_Account_Intake.flow"]
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://soap.sforce.com/2006/04/metadata}"
+    root = ET.fromstring(built)
+    start = root.find(f"{ns}start")
+    assert start is not None
+    assert start.findtext(f"{ns}locationX") is not None
+    assert start.findtext(f"{ns}locationY") is not None
+    conn = start.find(f"{ns}connector")
+    assert conn is not None
+    assert conn.findtext(f"{ns}targetReference") == "BasicInfo"
+    # Legacy pointer removed.
+    assert root.find(f"{ns}startElementReference") is None
+
+
+def test_flow_existing_start_is_preserved(valid_plan_dict):
+    """A flow that already uses a modern <start> is left untouched (no dup)."""
+    data = copy.deepcopy(valid_plan_dict)
+    body = _flow_body(
+        "    <start><locationX>50</locationX><locationY>0</locationY>"
+        "<connector><targetReference>BasicInfo</targetReference></connector>"
+        "</start>\n"
+        "    <screens><name>BasicInfo</name>"
+        "<locationX>176</locationX><locationY>134</locationY></screens>"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "flows/New_Account_Intake.flow", "body": body}],
+        "members": [{"type": "Flow", "name": "New_Account_Intake"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["flows/New_Account_Intake.flow"]
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://soap.sforce.com/2006/04/metadata}"
+    root = ET.fromstring(built)
+    assert len(root.findall(f"{ns}start")) == 1
+
+
+def test_custom_tab_sobject_name_is_stripped(valid_plan_dict):
+    """A custom-object CustomTab must not carry <sobjectName> — it fails with
+    'Element sobjectName invalid at this location in type CustomTab'."""
+    data = copy.deepcopy(valid_plan_dict)
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<CustomTab xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "    <customObject>true</customObject>\n"
+        "    <motif>Custom77: Document</motif>\n"
+        "    <sobjectName>Received_Document__c</sobjectName>\n"
+        "</CustomTab>\n"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [{"path": "tabs/Received_Document__c.tab", "body": body}],
+        "members": [{"type": "CustomTab", "name": "Received_Document__c"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["tabs/Received_Document__c.tab"]
+    assert "<sobjectName>" not in built
+    assert "<customObject>true</customObject>" in built
+
+
+def test_flexipage_component_identifier_is_injected(valid_plan_dict):
+    """Every FlexiPage <componentInstance> must have an <identifier> as its
+    first child, else deploy fails with 'doesn't have an identifier specified'.
+    """
+    data = copy.deepcopy(valid_plan_dict)
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<FlexiPage xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "    <flexiPageRegions>\n"
+        "        <name>main</name>\n"
+        "        <type>Region</type>\n"
+        "        <itemInstances>\n"
+        "            <componentInstance>\n"
+        "                <componentName>c:documentSplitClassify</componentName>\n"
+        "            </componentInstance>\n"
+        "        </itemInstances>\n"
+        "    </flexiPageRegions>\n"
+        "    <masterLabel>Document Processor</masterLabel>\n"
+        "    <template><name>flexipage:defaultAppHomeTemplate</name></template>\n"
+        "    <type>AppPage</type>\n"
+        "</FlexiPage>\n"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {"path": "flexipages/Document_Processor.flexipage-meta.xml", "body": body}
+        ],
+        "members": [{"type": "FlexiPage", "name": "Document_Processor"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))[
+        "flexipages/Document_Processor.flexipage-meta.xml"
+    ]
+    import xml.etree.ElementTree as ET
+
+    ns = "{http://soap.sforce.com/2006/04/metadata}"
+    root = ET.fromstring(built)
+    ci = next(root.iter(f"{ns}componentInstance"))
+    ident = ci.find(f"{ns}identifier")
+    assert ident is not None and ident.text
+    # identifier must be the first child (schema order).
+    assert list(ci)[0].tag.endswith("identifier")
+
+
+def test_flexipage_existing_identifier_is_preserved(valid_plan_dict):
+    """A componentInstance that already has an <identifier> is left as-is."""
+    data = copy.deepcopy(valid_plan_dict)
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<FlexiPage xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "    <flexiPageRegions>\n"
+        "        <name>main</name>\n"
+        "        <type>Region</type>\n"
+        "        <itemInstances>\n"
+        "            <componentInstance>\n"
+        "                <identifier>myCustomId</identifier>\n"
+        "                <componentName>c:foo</componentName>\n"
+        "            </componentInstance>\n"
+        "        </itemInstances>\n"
+        "    </flexiPageRegions>\n"
+        "    <masterLabel>P</masterLabel>\n"
+        "    <template><name>flexipage:defaultAppHomeTemplate</name></template>\n"
+        "    <type>AppPage</type>\n"
+        "</FlexiPage>\n"
+    )
+    data["steps"][0]["metadata_artifact"] = {
+        "files": [
+            {"path": "flexipages/P.flexipage-meta.xml", "body": body}
+        ],
+        "members": [{"type": "FlexiPage", "name": "P"}],
+    }
+    plan = Plan.model_validate(data)
+
+    built = _read_zip(build_package_zip(plan))["flexipages/P.flexipage-meta.xml"]
+    assert built.count("<identifier>") == 1
+    assert "<identifier>myCustomId</identifier>" in built
+
+
 def test_conflicting_non_mergeable_file_still_raises(valid_plan_dict):
     """Two steps emitting different bodies for a non-aggregate file (e.g. Apex)
     is a real conflict and must still be rejected."""

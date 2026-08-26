@@ -34,7 +34,7 @@ services:
         DATABASE_URL_SYNC=postgresql+psycopg2://postgres:postgres@localhost:5432/ona_planner \
           alembic upgrade head 2>/dev/null || true
         DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/ona_planner \
-          python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+          python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
       ready: curl -sf http://localhost:8000/api/planning/schema >/dev/null
     triggeredBy:
       - postDevcontainerStart
