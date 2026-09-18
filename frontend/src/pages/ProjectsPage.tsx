@@ -115,24 +115,56 @@ export default function ProjectsPage() {
   );
 
   return (
-    <Card
-      title="Migration Projects"
-      extra={
+    <div>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginBottom: 24,
+        }}
+      >
+        <div>
+          <h2 style={{ margin: 0, fontSize: 24, fontWeight: 600 }}>
+            Migration Projects
+          </h2>
+          <p style={{ margin: "4px 0 0", color: "#8c8c8c", fontSize: 14 }}>
+            Create and manage your data migration projects
+          </p>
+        </div>
         <Button
           type="primary"
           icon={<PlusOutlined />}
+          size="large"
           onClick={() => setModalOpen(true)}
+          style={{
+            borderRadius: 10,
+            height: 44,
+            paddingInline: 24,
+            fontWeight: 600,
+            background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+            border: "none",
+            boxShadow: "0 4px 15px rgba(102, 126, 234, 0.3)",
+          }}
         >
           New Project
         </Button>
-      }
-    >
-      <Table
-        dataSource={projects}
-        columns={columns}
-        rowKey="id"
-        loading={loading}
-      />
+      </div>
+      <Card
+        style={{
+          borderRadius: 12,
+          boxShadow: "0 2px 12px rgba(0,0,0,0.06)",
+          border: "1px solid #f0f0f0",
+        }}
+        styles={{ body: { padding: 0 } }}
+      >
+        <Table
+          dataSource={projects}
+          columns={columns}
+          rowKey="id"
+          loading={loading}
+          style={{ borderRadius: 12, overflow: "hidden" }}
+        />
 
       <Modal
         title="New Migration Project"
@@ -174,7 +206,8 @@ export default function ProjectsPage() {
             </Select>
           </Form.Item>
         </Form>
-      </Modal>
-    </Card>
+        </Modal>
+      </Card>
+    </div>
   );
 }

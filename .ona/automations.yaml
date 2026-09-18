@@ -1,46 +1,59 @@
 services:
-  - name: Database and Redis
+  database:
+    name: Database and Redis
     description: PostgreSQL and Redis via Docker Compose
-    command: |
-      cd /workspaces/workspaces && docker compose up db redis
+    commands:
+      start: cd /workspaces/CDE && docker compose up db redis
+      ready: docker exec workspaces-db-1 pg_isready
     triggeredBy:
       - postDevcontainerStart
 
-  - name: Backend API
-    description: FastAPI backend server with auto-restart
-    command: |
-      cd /workspaces/workspaces/backend
-      pip install -q -r requirements.txt
-      sleep 5
-      PYTHONPATH=. DATABASE_URL_SYNC=postgresql+psycopg2://postgres:postgres@localhost:5432/migration_bridge alembic upgrade head 2>/dev/null || true
-      while true; do
-        PYTHONPATH=. python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
-        echo "Backend exited, restarting in 3s..."
-        sleep 3
-      done
+  backend:
+    name: Backend API
+    description: FastAPI backend server
+    commands:
+      start: |
+        cd /workspaces/CDE/backend
+        pip install -q -r requirements.txt
+        alembic upgrade head
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      ready: curl -sf http://localhost:8000/docs > /dev/null
     triggeredBy:
       - postDevcontainerStart
 
-  - name: Frontend Dev Server
-    description: React frontend dev server with auto-restart
-    command: |
-      cd /workspaces/workspaces/frontend
-      npm install
-      while true; do
-        npm run dev
-        echo "Frontend exited, restarting in 3s..."
-        sleep 3
-      done
+  frontend:
+    name: Frontend Dev Server
+    description: React frontend dev server with Vite
+    commands:
+      start: |
+        cd /workspaces/CDE/frontend
+        npm install
+        npm run dev -- --host 0.0.0.0 --port 3000
+      ready: curl -sf http://localhost:3000 > /dev/null
     triggeredBy:
       - postDevcontainerStart
 
 tasks:
-  - name: Run DB Migrations
-    description: Run Alembic database migrations
+  open-ports:
+    name: Open Ports
+    description: Expose backend and frontend ports
     command: |
-      cd backend && PYTHONPATH=. DATABASE_URL_SYNC=postgresql+psycopg2://postgres:postgres@localhost:5432/migration_bridge alembic upgrade head
+      sleep 20
+      gitpod environment port open 8000 --name backend --admission organization 2>/dev/null || true
+      gitpod environment port open 3000 --name frontend --admission organization 2>/dev/null || true
+    triggeredBy:
+      - postDevcontainerStart
 
-  - name: Build Frontend
+  migrations:
+    name: Run DB Migrations
+    description: Run Alembic database migrations
+    command: cd /workspaces/CDE/backend && alembic upgrade head
+    triggeredBy:
+      - manual
+
+  build-frontend:
+    name: Build Frontend
     description: Build frontend for production
-    command: |
-      cd frontend && npm run build
+    command: cd /workspaces/CDE/frontend && npm run build
+    triggeredBy:
+      - manual

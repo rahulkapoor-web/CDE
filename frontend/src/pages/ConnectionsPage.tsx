@@ -16,12 +16,12 @@ import {
   PlusOutlined,
   ApiOutlined,
   DeleteOutlined,
-  CheckCircleOutlined,
-  CloseCircleOutlined,
+  EditOutlined,
 } from "@ant-design/icons";
 import {
   getConnections,
   createConnection,
+  updateConnection,
   deleteConnection,
   testConnection,
 } from "../services/api";
@@ -31,6 +31,7 @@ export default function ConnectionsPage() {
   const [connections, setConnections] = useState<ConnectionProfile[]>([]);
   const [loading, setLoading] = useState(false);
   const [modalOpen, setModalOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [form] = Form.useForm();
   const [systemType, setSystemType] = useState<string>("salesforce");
 
@@ -48,16 +49,44 @@ export default function ConnectionsPage() {
     load();
   }, []);
 
-  const handleCreate = async (values: Record<string, unknown>) => {
+  const handleSubmit = async (values: Record<string, unknown>) => {
     try {
-      await createConnection(values);
-      message.success("Connection created");
+      if (editingId) {
+        await updateConnection(editingId, values);
+        message.success("Connection updated");
+      } else {
+        await createConnection(values);
+        message.success("Connection created");
+      }
       setModalOpen(false);
+      setEditingId(null);
       form.resetFields();
       load();
     } catch (err: any) {
-      message.error(err.response?.data?.detail || "Failed to create");
+      message.error(err.response?.data?.detail || "Failed to save");
     }
+  };
+
+  const handleEdit = (record: ConnectionProfile) => {
+    setEditingId(record.id);
+    setSystemType(record.system_type);
+    form.resetFields();
+    // Only set non-sensitive fields — passwords and tokens are never returned from the API
+    form.setFieldsValue({
+      name: record.name,
+      system_type: record.system_type,
+      environment: record.environment,
+      sf_username: record.sf_username,
+      sf_instance_url: record.sf_instance_url,
+      sf_password: undefined,
+      sf_security_token: undefined,
+      sf_consumer_key: undefined,
+      sf_consumer_secret: undefined,
+      vault_dns: record.vault_dns,
+      vault_username: record.vault_username,
+      vault_password: undefined,
+    });
+    setModalOpen(true);
   };
 
   const handleDelete = async (id: string) => {
@@ -106,6 +135,13 @@ export default function ConnectionsPage() {
         <Space>
           <Button
             size="small"
+            icon={<EditOutlined />}
+            onClick={() => handleEdit(record)}
+          >
+            Edit
+          </Button>
+          <Button
+            size="small"
             icon={<ApiOutlined />}
             onClick={() => handleTest(record.id)}
           >
@@ -123,33 +159,74 @@ export default function ConnectionsPage() {
   ];
 
   return (
-    <Card
-      title="Connection Profiles"
-      extra={
+    <div>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginBottom: 24,
+        }}
+      >
+        <div>
+          <h2 style={{ margin: 0, fontSize: 24, fontWeight: 600 }}>
+            Connection Profiles
+          </h2>
+          <p style={{ margin: "4px 0 0", color: "#8c8c8c", fontSize: 14 }}>
+            Manage your Salesforce and Veeva Vault connections
+          </p>
+        </div>
         <Button
           type="primary"
           icon={<PlusOutlined />}
-          onClick={() => setModalOpen(true)}
+          size="large"
+          onClick={() => {
+            setEditingId(null);
+            form.resetFields();
+            setSystemType("salesforce");
+            setModalOpen(true);
+          }}
+          style={{
+            borderRadius: 10,
+            height: 44,
+            paddingInline: 24,
+            fontWeight: 600,
+            background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+            border: "none",
+            boxShadow: "0 4px 15px rgba(102, 126, 234, 0.3)",
+          }}
         >
           New Connection
         </Button>
-      }
-    >
-      <Table
-        dataSource={connections}
-        columns={columns}
-        rowKey="id"
-        loading={loading}
-      />
+      </div>
+      <Card
+        style={{
+          borderRadius: 12,
+          boxShadow: "0 2px 12px rgba(0,0,0,0.06)",
+          border: "1px solid #f0f0f0",
+        }}
+        styles={{ body: { padding: 0 } }}
+      >
+        <Table
+          dataSource={connections}
+          columns={columns}
+          rowKey="id"
+          loading={loading}
+          style={{ borderRadius: 12, overflow: "hidden" }}
+        />
 
       <Modal
-        title="New Connection"
+        title={editingId ? "Edit Connection" : "New Connection"}
         open={modalOpen}
-        onCancel={() => setModalOpen(false)}
+        onCancel={() => {
+          setModalOpen(false);
+          setEditingId(null);
+          form.resetFields();
+        }}
         onOk={() => form.submit()}
         width={600}
       >
-        <Form form={form} layout="vertical" onFinish={handleCreate}>
+        <Form form={form} layout="vertical" onFinish={handleSubmit}>
           <Form.Item name="name" label="Name" rules={[{ required: true }]}>
             <Input />
           </Form.Item>
@@ -187,19 +264,31 @@ export default function ConnectionsPage() {
                 <Input />
               </Form.Item>
               <Form.Item name="sf_password" label="Password">
-                <Input.Password />
+                <Input.Password
+                  placeholder={editingId ? "Leave blank to keep current" : ""}
+                  autoComplete="new-password"
+                />
               </Form.Item>
               <Form.Item name="sf_security_token" label="Security Token">
-                <Input.Password />
+                <Input
+                  placeholder={editingId ? "Leave blank to keep current" : ""}
+                  autoComplete="off"
+                />
               </Form.Item>
               <Form.Item name="sf_consumer_key" label="Consumer Key (optional)">
-                <Input />
+                <Input
+                  placeholder={editingId ? "Leave blank to keep current" : ""}
+                  autoComplete="off"
+                />
               </Form.Item>
               <Form.Item
                 name="sf_consumer_secret"
                 label="Consumer Secret (optional)"
               >
-                <Input.Password />
+                <Input.Password
+                  placeholder={editingId ? "Leave blank to keep current" : ""}
+                  autoComplete="new-password"
+                />
               </Form.Item>
             </>
           )}
@@ -213,12 +302,16 @@ export default function ConnectionsPage() {
                 <Input />
               </Form.Item>
               <Form.Item name="vault_password" label="Password">
-                <Input.Password />
+                <Input.Password
+                  placeholder={editingId ? "Leave blank to keep current" : ""}
+                  autoComplete="new-password"
+                />
               </Form.Item>
             </>
           )}
         </Form>
-      </Modal>
-    </Card>
+        </Modal>
+      </Card>
+    </div>
   );
 }

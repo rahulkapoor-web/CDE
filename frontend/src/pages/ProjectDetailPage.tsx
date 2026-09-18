@@ -979,12 +979,12 @@ export default function ProjectDetailPage() {
                           ),
                         },
                         {
-                          title: "Mismatched",
+                          title: "With Warnings",
                           dataIndex: "mismatched_count",
                           key: "mismatched_count",
                           render: (v: number) =>
                             v > 0 ? (
-                              <Text type="warning">{v}</Text>
+                              <Text type="warning">{v} ⚠️</Text>
                             ) : (
                               v
                             ),
@@ -1068,9 +1068,6 @@ export default function ProjectDetailPage() {
                         <Select.Option value="matched">
                           Matched
                         </Select.Option>
-                        <Select.Option value="mismatched">
-                          Mismatched
-                        </Select.Option>
                         <Select.Option value="missing_in_target">
                           Missing in Target
                         </Select.Option>
@@ -1094,7 +1091,8 @@ export default function ProjectDetailPage() {
                             return <Text type="secondary">No field data available</Text>;
                           }
                           const entries = Object.entries(diffs) as [string, any][];
-                          const mismatches = entries.filter((e) => e[1].diff_type !== "match");
+                          const mismatches = entries.filter((e) => e[1].diff_type !== "match" && e[1].diff_type !== "id_reference");
+                          const idRefs = entries.filter((e) => e[1].diff_type === "id_reference");
                           const matches = entries.filter((e) => e[1].diff_type === "match");
 
                           return (
@@ -1166,9 +1164,65 @@ export default function ProjectDetailPage() {
                                   />
                                 </>
                               )}
+                              {idRefs.length > 0 && (
+                                <>
+                                  <Text strong style={{ color: "#1677ff", display: "block", marginTop: mismatches.length > 0 ? 16 : 0, marginBottom: 8 }}>
+                                    ID References — expected to differ ({idRefs.length})
+                                  </Text>
+                                  <Table
+                                    dataSource={idRefs.map(([field, d]) => ({
+                                      key: field,
+                                      sourceField: d.source_field || field,
+                                      targetField: d.target_field || field,
+                                      sourceValue: d.source,
+                                      targetValue: d.target,
+                                    }))}
+                                    size="small"
+                                    pagination={idRefs.length > 10 ? { pageSize: 10 } : false}
+                                    columns={[
+                                      {
+                                        title: "Status",
+                                        key: "status",
+                                        width: 120,
+                                        render: () => <Tag color="blue">ID Reference</Tag>,
+                                      },
+                                      {
+                                        title: "Source Field",
+                                        dataIndex: "sourceField",
+                                        key: "srcField",
+                                      },
+                                      {
+                                        title: "Source Value",
+                                        dataIndex: "sourceValue",
+                                        key: "srcVal",
+                                        render: (v: unknown) => (
+                                          <Text type="secondary">
+                                            {v === null || v === undefined ? <i>null</i> : String(v)}
+                                          </Text>
+                                        ),
+                                      },
+                                      {
+                                        title: "Target Field",
+                                        dataIndex: "targetField",
+                                        key: "tgtField",
+                                      },
+                                      {
+                                        title: "Target Value",
+                                        dataIndex: "targetValue",
+                                        key: "tgtVal",
+                                        render: (v: unknown) => (
+                                          <Text type="secondary">
+                                            {v === null || v === undefined ? <i>null</i> : String(v)}
+                                          </Text>
+                                        ),
+                                      },
+                                    ]}
+                                  />
+                                </>
+                              )}
                               {matches.length > 0 && (
                                 <>
-                                  <Text strong style={{ color: "#389e0d", display: "block", marginTop: mismatches.length > 0 ? 16 : 0, marginBottom: 8 }}>
+                                  <Text strong style={{ color: "#389e0d", display: "block", marginTop: (mismatches.length > 0 || idRefs.length > 0) ? 16 : 0, marginBottom: 8 }}>
                                     Matching Attributes ({matches.length})
                                   </Text>
                                   <Table
@@ -1232,13 +1286,19 @@ export default function ProjectDetailPage() {
                           title: "Status",
                           dataIndex: "status",
                           key: "status",
-                          render: (v: string) => {
-                            const colors: Record<string, string> = {
-                              matched: "green",
-                              mismatched: "orange",
-                              missing_in_target: "red",
-                            };
-                            return <Tag color={colors[v] || "default"}>{v.replace(/_/g, " ")}</Tag>;
+                          render: (v: string, r: ValidationDetail) => {
+                            if (v === "missing_in_target") {
+                              return <Tag color="red">missing in target</Tag>;
+                            }
+                            // Check if there are field-level warnings
+                            const diffs = r.field_diffs ? Object.values(r.field_diffs) as any[] : [];
+                            const hasWarnings = diffs.some((e) =>
+                              e.diff_type === "value_mismatch" || e.diff_type === "missing_attribute" || e.diff_type === "extra_in_target"
+                            );
+                            if (hasWarnings) {
+                              return <Tag color="green">matched ⚠️</Tag>;
+                            }
+                            return <Tag color="green">matched</Tag>;
                           },
                         },
                         {
@@ -1250,13 +1310,13 @@ export default function ProjectDetailPage() {
                             }
                             if (!r.field_diffs) return "-";
                             const entries = Object.values(r.field_diffs) as any[];
-                            const matchCount = entries.filter((e) => e.diff_type === "match").length;
+                            const matchCount = entries.filter((e) => e.diff_type === "match" || e.diff_type === "id_reference").length;
                             const mismatchCount = entries.filter((e) => e.diff_type === "value_mismatch").length;
                             const missingCount = entries.filter((e) => e.diff_type === "missing_attribute").length;
                             return (
                               <Space>
                                 {matchCount > 0 && <Tag color="green">{matchCount} matched</Tag>}
-                                {mismatchCount > 0 && <Tag color="orange">{mismatchCount} mismatched</Tag>}
+                                {mismatchCount > 0 && <Tag color="orange">{mismatchCount} warnings</Tag>}
                                 {missingCount > 0 && <Tag color="red">{missingCount} missing</Tag>}
                               </Space>
                             );

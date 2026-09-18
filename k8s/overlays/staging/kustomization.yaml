@@ -1,0 +1,35 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: migration-bridge-staging
+
+resources:
+  - ../../base
+
+patches:
+  # Override image registry for staging
+  - target:
+      kind: Deployment
+      name: backend
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: eu.repository.roche.com/cde-gitpod-docker-prd-l/migration-bridge-backend:latest
+  - target:
+      kind: Deployment
+      name: frontend
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: eu.repository.roche.com/cde-gitpod-docker-prd-l/migration-bridge-frontend:latest
+  # Override ingress host for staging
+  - target:
+      kind: Ingress
+      name: migration-bridge
+    patch: |
+      - op: replace
+        path: /spec/rules/0/host
+        value: migration-bridge.service-staging.roche.com
+      - op: replace
+        path: /spec/tls/0/hosts/0
+        value: migration-bridge.service-staging.roche.com

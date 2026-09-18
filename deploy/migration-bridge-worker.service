@@ -1,0 +1,21 @@
+[Unit]
+Description=Migration Bridge — Celery Worker
+After=network.target redis.service
+Requires=redis.service
+
+[Service]
+Type=simple
+User=migbridge
+Group=migbridge
+WorkingDirectory=/opt/migration-bridge/repo/backend
+EnvironmentFile=/opt/migration-bridge/.env
+Environment=PYTHONPATH=/opt/migration-bridge/repo/backend
+ExecStart=/opt/migration-bridge/venv/bin/celery -A app.worker worker \
+    --loglevel=info \
+    --concurrency=4 \
+    --logfile=/var/log/migration-bridge/worker.log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

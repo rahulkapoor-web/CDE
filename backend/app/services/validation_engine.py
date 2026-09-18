@@ -25,10 +25,20 @@ logger = logging.getLogger(__name__)
 def _normalize_value(value: Any, field_type: str = "") -> str | None:
     """Normalize a field value for comparison.
 
-    Handles: whitespace, case for text, date formats, None/empty.
+    Handles: whitespace, case for text, date formats, None/empty,
+    list/array unwrapping (Vault picklists return single-element arrays).
     """
     if value is None:
         return None
+    # Unwrap single-element lists (Vault picklist values come as arrays)
+    if isinstance(value, list):
+        if len(value) == 0:
+            return None
+        if len(value) == 1:
+            value = value[0]
+        else:
+            # Multi-value: sort and join for consistent comparison
+            return ";".join(sorted(str(v).strip().lower() for v in value))
     if isinstance(value, bool):
         return str(value).lower()
     if isinstance(value, (int, float)):
@@ -39,21 +49,225 @@ def _normalize_value(value: Any, field_type: str = "") -> str | None:
     if not s:
         return None
 
-    # Normalize dates: try to parse ISO formats
-    ft_lower = field_type.lower()
-    if ft_lower in ("date", "datetime"):
-        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%f%z"):
-            try:
-                dt = datetime.strptime(s, fmt)
-                if ft_lower == "date":
-                    return dt.strftime("%Y-%m-%d")
-                return dt.strftime("%Y-%m-%dT%H:%M:%S")
-            except ValueError:
-                continue
+    # Detect stringified lists like "['submitted__v']"
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1].strip()
+        # Remove surrounding quotes
+        if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
+            s = s[1:-1].strip()
+        if not s:
+            return None
+
+    # Try date normalization — either when field_type hints at it,
+    # or when the value looks like a date/datetime string
+    parsed_date = _try_parse_date(s, field_type)
+    if parsed_date is not None:
+        return parsed_date
 
     # General text: lowercase, collapse whitespace
     s = re.sub(r"\s+", " ", s).lower()
     return s
+
+
+# Regex to detect date-like strings: 2025-09-10, 2025-09-10T14:05:10...
+_DATE_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}"  # starts with YYYY-MM-DD
+)
+
+# Formats to try, ordered from most specific to least
+_DATE_FORMATS = [
+    "%Y-%m-%dT%H:%M:%S.%f%z",   # 2025-09-10T14:05:10.000+0000
+    "%Y-%m-%dT%H:%M:%S.%fZ",    # 2025-09-10T14:05:10.000Z
+    "%Y-%m-%dT%H:%M:%S%z",      # 2025-09-10T14:05:10+0000
+    "%Y-%m-%dT%H:%M:%SZ",       # 2025-09-10T14:05:10Z
+    "%Y-%m-%dT%H:%M:%S",        # 2025-09-10T14:05:10
+    "%Y-%m-%d",                  # 2025-09-10
+]
+
+
+def _try_parse_date(s: str, field_type: str = "") -> str | None:
+    """Try to parse a string as a date/datetime.
+
+    Returns a normalized date string if successful, None otherwise.
+    Detects dates by field_type hint or by matching date-like patterns.
+    """
+    ft_lower = field_type.lower()
+    is_date_field = ft_lower in ("date", "datetime", "date/time")
+
+    # Only attempt parsing if field type says date OR value looks like a date
+    if not is_date_field and not _DATE_PATTERN.match(s):
+        return None
+
+    for fmt in _DATE_FORMATS:
+        try:
+            dt = datetime.strptime(s, fmt)
+            # If the value is date-only (no time component in the string),
+            # normalize to date only
+            if "T" not in s:
+                return dt.strftime("%Y-%m-%d")
+            # For datetime values, normalize to second precision without timezone
+            # This makes 2025-09-10T14:05:10.000+0000 == 2025-09-10T14:05:10.000Z
+            return dt.strftime("%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+
+    return None
+
+
+def _values_equivalent(src_val: str | None, tgt_val: str | None) -> bool:
+    """Check if two normalized values are semantically equivalent.
+
+    Handles cross-system differences:
+      - null/empty vs 0: null ≈ 0 (empty numeric defaults)
+      - 0/1 vs false/true: numeric booleans
+      - 'Submitted' vs 'submitted_v': Vault API name suffixes (__v, __c)
+      - 'Some Value' vs 'some_value__v': snake_case API names
+    """
+    if src_val is None and tgt_val is None:
+        return True
+    if src_val == tgt_val:
+        return True
+
+    # null vs 0 — treat as equivalent
+    zero_vals = {"0", "0.0", "0.00"}
+    if src_val is None and tgt_val in zero_vals:
+        return True
+    if tgt_val is None and src_val in zero_vals:
+        return True
+
+    # 0/1 vs false/true
+    bool_map = {"0": "false", "1": "true", "0.0": "false", "1.0": "true"}
+    if src_val in bool_map and tgt_val == bool_map[src_val]:
+        return True
+    if tgt_val in bool_map and src_val == bool_map[tgt_val]:
+        return True
+
+    # Strip Vault suffixes (__v, __c, __sys, _v, _c) and compare
+    if src_val is not None and tgt_val is not None:
+        src_clean = re.sub(r"(__v|__c|__sys|_v|_c)$", "", src_val)
+        tgt_clean = re.sub(r"(__v|__c|__sys|_v|_c)$", "", tgt_val)
+
+        # Direct match after stripping suffixes
+        if src_clean == tgt_clean:
+            return True
+
+        # snake_case vs human-readable: "submitted" vs "submitted",
+        # "some value" vs "some_value"
+        src_snake = src_clean.replace(" ", "_").replace("-", "_")
+        tgt_snake = tgt_clean.replace(" ", "_").replace("-", "_")
+        if src_snake == tgt_snake:
+            return True
+
+    return False
+
+
+def _is_id_or_reference(source_type: str, target_type: str) -> bool:
+    """Check if a field mapping represents an ID or reference/lookup field.
+
+    These fields will always differ between Salesforce and Vault because
+    each system generates its own IDs.
+    """
+    src = (source_type or "").lower()
+    tgt = (target_type or "").lower()
+
+    id_indicators = ("id", "reference", "lookup", "record type")
+    tgt_id_indicators = ("id", "object")
+
+    if any(src.startswith(ind) or src == ind for ind in id_indicators):
+        return True
+    if tgt in tgt_id_indicators:
+        return True
+    return False
+
+
+def _dates_match(src_val: str | None, tgt_val: str | None) -> bool:
+    """Check if two normalized values represent the same date.
+
+    Handles cases like datetime vs date-only:
+      '2025-09-16T22:00:00' vs '2025-09-16' → True (same date)
+    """
+    if src_val is None or tgt_val is None:
+        return False
+    # Both must look like dates
+    if not _DATE_PATTERN.match(src_val) or not _DATE_PATTERN.match(tgt_val):
+        return False
+    # Extract date portion (first 10 chars: YYYY-MM-DD)
+    return src_val[:10] == tgt_val[:10]
+
+
+async def _rewrite_where_for_child(
+    db: AsyncSession,
+    where_clause: str,
+    object_mapping,
+    field_mappings: list,
+) -> str:
+    """Rewrite a WHERE clause for child objects by adding parent relationship prefix.
+
+    If the WHERE clause references a field (e.g., OCE__Account__c) that doesn't exist
+    directly on this object but exists on a parent object reachable via a lookup field,
+    rewrite it to use the relationship path (e.g., OCE__Call__r.OCE__Account__c).
+    """
+    # Extract field names referenced in the WHERE clause
+    # Match patterns like: field_name IN (...) or field_name = '...'
+    referenced_fields = set(re.findall(r"(\w+__c)\s*(?:in|=|!=|<|>|like)", where_clause, re.IGNORECASE))
+
+    if not referenced_fields:
+        return where_clause
+
+    # Get all fields on this object (from field mappings)
+    object_fields = {fm.source_field for fm in field_mappings}
+
+    # Find fields in WHERE that are NOT on this object
+    missing_fields = referenced_fields - object_fields
+
+    if not missing_fields:
+        return where_clause  # All fields exist on this object, no rewrite needed
+
+    # Find lookup fields on this object that could be parent relationships.
+    # Exclude system lookups (CreatedById, LastModifiedById, OwnerId) — these
+    # point to User, not to the business parent object.
+    system_lookups = {"createdbyid", "lastmodifiedbyid", "ownerid", "userrecordaccessid"}
+    lookup_fields = [
+        fm for fm in field_mappings
+        if fm.source_field_type and "lookup" in fm.source_field_type.lower()
+        and fm.source_field.endswith("__c")
+        and fm.source_field.lower() not in system_lookups
+    ]
+
+    if not lookup_fields:
+        return where_clause
+
+    # For each missing field, find the best parent lookup to prefix with.
+    # Prefer lookups whose name shares a prefix with the object name
+    # (e.g., OCE__Call__c for OCE__CallEmployeeAttendee__c)
+    for missing_field in missing_fields:
+        best_lookup = None
+        for lookup in lookup_fields:
+            # Check if the lookup type hints at the parent having this field
+            lookup_type = (lookup.source_field_type or "").lower()
+            if "account" in lookup_type and "account" in missing_field.lower():
+                best_lookup = lookup
+                break
+            if "interaction" in lookup_type or "call" in lookup.source_field.lower():
+                best_lookup = lookup
+                # Don't break — keep looking for a more specific match
+
+        if not best_lookup:
+            best_lookup = lookup_fields[0]  # Fallback to first non-system lookup
+
+        # Convert lookup field name to relationship name: OCE__Call__c -> OCE__Call__r
+        rel_name = best_lookup.source_field[:-1] + "r"
+        where_clause = re.sub(
+            rf"\b{re.escape(missing_field)}\b",
+            f"{rel_name}.{missing_field}",
+            where_clause,
+        )
+        logger.info(
+            f"Rewrote WHERE for {object_mapping.source_object}: "
+            f"{missing_field} -> {rel_name}.{missing_field}"
+        )
+
+    return where_clause
 
 
 def _build_match_key(record: dict, key_fields: list[str]) -> str:
@@ -88,9 +302,21 @@ async def run_validation_for_object(
     match_keys = list(match_keys_result.scalars().all())
 
     if not match_keys:
-        raise ValueError(
-            f"No match keys configured for {object_mapping.source_object} -> {object_mapping.target_object}"
+        logger.warning(
+            f"No match keys configured for {object_mapping.source_object} -> {object_mapping.target_object}, skipping"
         )
+        # Create a skipped summary instead of failing the entire run
+        summary = ValidationSummary(
+            validation_run_id=validation_run.id,
+            object_mapping_id=object_mapping.id,
+            source_object=object_mapping.source_object,
+            target_object=object_mapping.target_object,
+            status="skipped",
+            error_message="No match keys configured — skipped",
+        )
+        db.add(summary)
+        await db.flush()
+        return summary
 
     # Create summary record
     summary = ValidationSummary(
@@ -177,6 +403,14 @@ async def run_validation_for_object(
             cw = custom_where.strip()
             if cw.upper().startswith("WHERE "):
                 cw = cw[6:]
+
+            # For child objects, rewrite field references to use parent relationship.
+            # e.g., if WHERE clause has OCE__Account__c and this object has a lookup
+            # field OCE__Call__c pointing to the parent, rewrite to OCE__Call__r.OCE__Account__c
+            cw = await _rewrite_where_for_child(
+                db, cw, object_mapping, field_mappings
+            )
+
             where_parts.append(f"({cw})")
 
         source_where = ""
@@ -319,8 +553,19 @@ async def run_validation_for_object(
                     "target_field": fm.target_field,
                 }
 
+                is_ref = _is_id_or_reference(
+                    fm.source_field_type or "", fm.target_field_type or ""
+                )
+
                 if src_val == tgt_val:
                     entry["diff_type"] = "match"
+                elif _dates_match(src_val, tgt_val):
+                    entry["diff_type"] = "match"
+                elif _values_equivalent(src_val, tgt_val):
+                    entry["diff_type"] = "match"
+                elif is_ref:
+                    # ID/reference fields always differ between systems — not a mismatch
+                    entry["diff_type"] = "id_reference"
                 elif src_val is not None and tgt_val is None:
                     entry["diff_type"] = "missing_attribute"
                     has_mismatch = True
@@ -333,26 +578,19 @@ async def run_validation_for_object(
 
                 field_details[fm.source_field] = entry
 
+            # Record is always "matched" if found in target.
+            # Field-level diffs are warnings, not record-level failures.
+            matched += 1
             if has_mismatch:
-                mismatched += 1
-                details_to_add.append(
-                    ValidationDetail(
-                        summary_id=summary.id,
-                        match_key_value=key,
-                        status="mismatched",
-                        field_diffs=field_details,
-                    )
+                mismatched += 1  # track for summary stats, but record status stays "matched"
+            details_to_add.append(
+                ValidationDetail(
+                    summary_id=summary.id,
+                    match_key_value=key,
+                    status="matched",
+                    field_diffs=field_details,
                 )
-            else:
-                matched += 1
-                details_to_add.append(
-                    ValidationDetail(
-                        summary_id=summary.id,
-                        match_key_value=key,
-                        status="matched",
-                        field_diffs=field_details,
-                    )
-                )
+            )
 
         validation_run.records_compared = compared_count
 

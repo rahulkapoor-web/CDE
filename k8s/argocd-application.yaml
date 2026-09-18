@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: migration-bridge-staging
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/rahulkapoor-web/CDE.git
+    targetRevision: feature/migration-bridge
+    path: k8s/overlays/staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: migration-bridge-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

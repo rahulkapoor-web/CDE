@@ -1,0 +1,38 @@
+Step,Object Name,Parent object,Designated team
+1,account__v,user__sys,integration
+1,user__sys,account__v,integration to valign then to Vault CRM
+2,territory__v,user__sys; parent_territorry__v(self lookup),valign
+2,account_plan__v,account__v; user__sys,Data Migration
+2,address__v,account__v,integration
+2,affiliation__v,account__v; user__sys,integration
+2,child_account__v,account__v; user__sys,integration
+2,product__v,user__sys,integration
+2,user_role__sys,user__sys,valign
+3,time_off_territory__v,"user__sys, territory__v",Data Migration
+3,account_territory__v,"account__v, territory__v",valign
+3,user_territory__v,"user__sys, territory__v",valign
+4,account_team_member__v,account_plan__v; user__sys,Data Migration
+4,key_message__v,product__v; user__sys,Data Migration
+4,key_stakeholder__v,account__v; account_plan__v; user__sys,Data Migration
+4,medical_event__v,account__v; address__v; user__sys,Data Migration
+4,my_setup_products__v,product__v; user__sys,valign
+4,plan_tactic__v,account_plan__v; product__v; user__sys,Data Migration
+4,product_metrics__v,account__v; child_account__v; product__v,Data Migration
+4,sample_limit__v,account__v; product__v; user__sys,Under discussion
+4,swot__v,account_plan__v; product__v,Data Migration
+4,tsf__v,account__v; address__v,Data Migration
+5,account_tactic__v,account__v; account_plan__v; plan_tactic__v; user__sys,Data Migration
+5,call2__v,account__v; account_plan__v; address__v; child_account__v; medical_event__v; medical_inquiry__v; product__v; user__sys,Data Migration
+5,medical_inquiry__v,account__v; call2__v; child_account__v; product__v; user__sys,Data Migration
+6,action_item__v,account__v; account_plan__v; account_tactic__v; call2__v; plan_tactic__v; user__sys,Data Migration
+6,call_objective__v,account__v; account_plan__v; account_tactic__v; call2__v; key_stakeholder__v; plan_tactic__v; product__v; user__sys,Data Migration
+6,call2_detail__v,call2__v; product__v,Data Migration
+6,call2_discussion__v,account__v; account_tactic__v; call2__v; medical_event__v; product__v; user__sys,Data Migration
+6,call2_key_message__v,account__v; call2__v; key_message__v; product__v; user__sys,Data Migration
+6,call2_sample__v,account__v; call2__v; product__v,Data Migration
+6,medical_inquiry_fulfillment__v,account__v; call2__v; child_account__v; medical_inquiry__v; user__sys,Data Migration
+6,medical_insight__v,account__v; account_plan__v; call2__v; medical_event__v; user__sys,Data Migration
+6,sample_limit_transaction__v,account__v; call2__v; product__v; sample_limit__v; user__sys,Under discussion
+6,sent_email__v,account__v; call2__v; event_attendee__v; key_message__v; medical_event__v; medical_inquiry__v; product__v; user__sys,Data Migration
+7,medical_inquiry_fulfillment_response__v,call2__v; medical_inquiry_fulfillment__v; user__sys,Data Migration
+8,question_response__v,survey__v; survey_question__v; survey_target__v,Data Migration

@@ -1,0 +1,24 @@
+[Unit]
+Description=Migration Bridge — Backend API
+After=network.target redis.service
+Requires=redis.service
+
+[Service]
+Type=simple
+User=migbridge
+Group=migbridge
+WorkingDirectory=/opt/migration-bridge/repo/backend
+EnvironmentFile=/opt/migration-bridge/.env
+Environment=PYTHONPATH=/opt/migration-bridge/repo/backend
+ExecStart=/opt/migration-bridge/venv/bin/gunicorn app.main:app \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --workers 4 \
+    --bind 127.0.0.1:8000 \
+    --timeout 300 \
+    --access-logfile /var/log/migration-bridge/api-access.log \
+    --error-logfile /var/log/migration-bridge/api-error.log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
