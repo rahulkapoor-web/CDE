@@ -70,7 +70,11 @@ async def list_cleanup_jobs(
     """List cleanup jobs for a project."""
     result = await db.execute(
         select(CleanupJob)
-        .where(CleanupJob.project_id == project_id, CleanupJob.user_id == user.id)
+        .where(
+            CleanupJob.project_id == project_id,
+            CleanupJob.user_id == user.id,
+            CleanupJob.archived_at.is_(None),
+        )
         .order_by(CleanupJob.created_at.desc())
     )
     return list(result.scalars().all())

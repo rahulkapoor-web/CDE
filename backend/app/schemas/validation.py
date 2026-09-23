@@ -21,6 +21,7 @@ class ValidationRunResponse(BaseModel):
     completed_at: datetime | None = None
     error_message: str | None = None
     created_at: datetime
+    archived_at: datetime | None = None
     object_mapping_ids: list[str] | None = None
     record_limit: int | None = None
     date_range_months: int | None = None

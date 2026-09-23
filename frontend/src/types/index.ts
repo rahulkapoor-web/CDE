@@ -96,6 +96,7 @@ export interface ValidationRun {
   completed_at?: string;
   error_message?: string;
   created_at: string;
+  archived_at?: string;
   object_mapping_ids?: string[];
   record_limit?: number;
   date_range_months?: number;

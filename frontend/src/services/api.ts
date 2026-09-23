@@ -53,6 +53,8 @@ export const createProject = (data: Record<string, unknown>) =>
   api.post("/projects", data);
 export const getProject = (id: string) => api.get(`/projects/${id}`);
 export const deleteProject = (id: string) => api.delete(`/projects/${id}`);
+export const archiveHistoricalLogs = (projectId: string) =>
+  api.post(`/projects/${projectId}/logs/archive`);
 
 // Schema
 export const getSourceObjects = (projectId: string) =>

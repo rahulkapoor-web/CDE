@@ -31,6 +31,9 @@ class ValidationRun(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    archived_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Track which object mappings were included in this run
     object_mapping_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
 

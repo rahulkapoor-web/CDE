@@ -116,7 +116,19 @@ def upgrade() -> None:
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("error_message", sa.Text, nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("archived_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("object_mapping_ids", sa.JSON, nullable=True),
+        sa.Column("record_limit", sa.Integer, nullable=True),
+        sa.Column("date_range_months", sa.Integer, nullable=True),
+        sa.Column("source_where_clause", sa.Text, nullable=True),
+        sa.Column("total_objects", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("completed_objects", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("current_object_name", sa.String(255), nullable=True),
+        sa.Column("progress_phase", sa.String(50), nullable=True),
+        sa.Column("source_records_fetched", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("target_records_fetched", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("records_compared", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("total_records_to_compare", sa.Integer, nullable=False, server_default="0"),
     )
     op.create_index("ix_validation_runs_project_id", "validation_runs", ["project_id"])
 
@@ -153,8 +165,32 @@ def upgrade() -> None:
     op.create_index("ix_validation_details_match_key", "validation_details", ["match_key_value"])
     op.create_index("ix_validation_details_status", "validation_details", ["status"])
 
+    # Cleanup Jobs
+    op.create_table(
+        "cleanup_jobs",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("project_id", sa.String(36), sa.ForeignKey("migration_projects.id"), nullable=True),
+        sa.Column("user_id", sa.String(36), sa.ForeignKey("users.id"), nullable=True),
+        sa.Column("status", sa.String(20), nullable=True, server_default="pending"),
+        sa.Column("filter_mode", sa.String(20), nullable=True, server_default="legacy_crm_id"),
+        sa.Column("country_code", sa.String(10), nullable=True),
+        sa.Column("total_steps", sa.Integer, nullable=True, server_default="0"),
+        sa.Column("completed_steps", sa.Integer, nullable=True, server_default="0"),
+        sa.Column("current_object", sa.String(255), nullable=True),
+        sa.Column("current_phase", sa.String(50), nullable=True),
+        sa.Column("records_found", sa.Integer, nullable=True, server_default="0"),
+        sa.Column("records_deleted", sa.Integer, nullable=True, server_default="0"),
+        sa.Column("step_results", sa.JSON, nullable=True),
+        sa.Column("error_message", sa.Text, nullable=True),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=True, server_default=sa.func.now()),
+        sa.Column("archived_at", sa.DateTime(timezone=True), nullable=True),
+    )
+
 
 def downgrade() -> None:
+    op.drop_table("cleanup_jobs")
     op.drop_table("validation_details")
     op.drop_table("validation_summaries")
     op.drop_table("validation_runs")

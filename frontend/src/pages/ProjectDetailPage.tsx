@@ -31,6 +31,7 @@ import {
   LoadingOutlined,
   CloudSyncOutlined,
   SwapOutlined,
+  InboxOutlined,
 } from "@ant-design/icons";
 import { useParams } from "react-router-dom";
 import {
@@ -63,6 +64,7 @@ import {
   getValidationDetails,
   exportSummaryReport,
   exportDetailReport,
+  archiveHistoricalLogs,
 } from "../services/api";
 import { downloadBlob } from "../utils/download";
 import type {
@@ -123,6 +125,7 @@ export default function ProjectDetailPage() {
 
   // Cleanup state
   const [cleanupJobs, setCleanupJobs] = useState<any[]>([]);
+  const [archivingLogs, setArchivingLogs] = useState(false);
   const [cleanupModalOpen, setCleanupModalOpen] = useState(false);
   const [cleanupFilterMode, setCleanupFilterMode] = useState("legacy_crm_id");
   const [cleanupCountryCode, setCleanupCountryCode] = useState("");
@@ -389,6 +392,42 @@ export default function ProjectDetailPage() {
     const res = await exportDetailReport(summaryId);
     downloadBlob(res.data, "validation_details.csv");
   };
+
+  const handleArchiveHistoricalLogs = async () => {
+    if (!projectId) return;
+    setArchivingLogs(true);
+    try {
+      const res = await archiveHistoricalLogs(projectId);
+      const deletedCount = res.data.deleted_count ?? res.data.archived_count ?? 0;
+      if (deletedCount > 0) {
+        message.success(res.data.detail);
+      } else {
+        message.info("No logs older than 2 weeks to archive");
+      }
+      setSelectedRun(null);
+      setSelectedSummary(null);
+      setSummaries([]);
+      setDetails([]);
+      await Promise.all([loadProject(), loadCleanupJobs()]);
+    } catch (e: any) {
+      message.error(e.response?.data?.detail || "Failed to archive logs");
+    } finally {
+      setArchivingLogs(false);
+    }
+  };
+
+  const archiveHistoricalLogsButton = (
+    <Popconfirm
+      title="Archive historical logs?"
+      description="Completed, failed, and cancelled logs older than 2 weeks will be permanently deleted from the database."
+      okText="Archive"
+      onConfirm={handleArchiveHistoricalLogs}
+    >
+      <Button icon={<InboxOutlined />} loading={archivingLogs}>
+        Archive Logs
+      </Button>
+    </Popconfirm>
+  );
 
   // Cleanup handlers
   const loadCleanupJobs = async () => {
@@ -701,12 +740,15 @@ export default function ProjectDetailPage() {
                 <Card
                   title="Validation Runs"
                   extra={
-                    <Button
-                      type="primary"
-                      onClick={() => setRunValidationOpen(true)}
-                    >
-                      New Validation Run
-                    </Button>
+                    <Space>
+                      {archiveHistoricalLogsButton}
+                      <Button
+                        type="primary"
+                        onClick={() => setRunValidationOpen(true)}
+                      >
+                        New Validation Run
+                      </Button>
+                    </Space>
                   }
                 >
                   <Table
@@ -1341,6 +1383,7 @@ export default function ProjectDetailPage() {
                       <Button onClick={loadCleanupJobs} icon={<SyncOutlined />}>
                         Refresh
                       </Button>
+                      {archiveHistoricalLogsButton}
                       <Button
                         type="primary"
                         danger

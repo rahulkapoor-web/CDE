@@ -1,4 +1,5 @@
 import io
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, delete
@@ -10,6 +11,8 @@ from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.connection import ConnectionProfile
 from app.models.mapping import MigrationProject, ObjectMapping, FieldMapping, MatchKeyConfig
+from app.models.cleanup import CleanupJob
+from app.models.validation import ValidationRun, ValidationSummary, ValidationDetail
 from app.schemas.mapping import (
     MigrationProjectCreate,
     MigrationProjectResponse,
@@ -70,6 +73,85 @@ async def get_project(
     if not project or project.created_by != user.id:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
+
+
+@router.post("/{project_id}/logs/archive")
+async def archive_historical_logs(
+    project_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await db.get(MigrationProject, project_id)
+    if not project or project.created_by != user.id:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+    inactive_statuses = ("completed", "failed", "cancelled")
+
+    eligible_run_ids_result = await db.execute(
+        select(ValidationRun.id).where(
+            ValidationRun.project_id == project_id,
+            ValidationRun.user_id == user.id,
+            ValidationRun.created_at < cutoff,
+            ValidationRun.status.in_(inactive_statuses),
+        )
+    )
+    validation_run_ids = list(eligible_run_ids_result.scalars().all())
+
+    validation_details_count = 0
+    validation_summaries_count = 0
+    validation_runs_count = 0
+    if validation_run_ids:
+        eligible_summary_ids_result = await db.execute(
+            select(ValidationSummary.id).where(
+                ValidationSummary.validation_run_id.in_(validation_run_ids)
+            )
+        )
+        validation_summary_ids = list(eligible_summary_ids_result.scalars().all())
+
+        if validation_summary_ids:
+            validation_details_result = await db.execute(
+                delete(ValidationDetail).where(
+                    ValidationDetail.summary_id.in_(validation_summary_ids)
+                )
+            )
+            validation_details_count = validation_details_result.rowcount or 0
+
+            validation_summaries_result = await db.execute(
+                delete(ValidationSummary).where(
+                    ValidationSummary.id.in_(validation_summary_ids)
+                )
+            )
+            validation_summaries_count = validation_summaries_result.rowcount or 0
+
+        validation_runs_result = await db.execute(
+            delete(ValidationRun).where(ValidationRun.id.in_(validation_run_ids))
+        )
+        validation_runs_count = validation_runs_result.rowcount or 0
+
+    cleanup_jobs_result = await db.execute(
+        delete(CleanupJob)
+        .where(
+            CleanupJob.project_id == project_id,
+            CleanupJob.user_id == user.id,
+            CleanupJob.created_at < cutoff,
+            CleanupJob.status.in_(inactive_statuses),
+        )
+    )
+    await db.commit()
+
+    cleanup_count = cleanup_jobs_result.rowcount or 0
+    total_count = validation_runs_count + cleanup_count
+    return {
+        "detail": f"Archived and deleted {total_count} historical logs",
+        "archived_count": total_count,
+        "deleted_count": total_count,
+        "validation_runs_deleted": validation_runs_count,
+        "validation_summaries_deleted": validation_summaries_count,
+        "validation_details_deleted": validation_details_count,
+        "cleanup_jobs_deleted": cleanup_count,
+        "cutoff": cutoff,
+    }
 
 
 @router.delete("/{project_id}")

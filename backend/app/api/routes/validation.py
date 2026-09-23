@@ -154,7 +154,10 @@ async def list_validation_runs(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(ValidationRun).where(ValidationRun.user_id == user.id)
+    query = select(ValidationRun).where(
+        ValidationRun.user_id == user.id,
+        ValidationRun.archived_at.is_(None),
+    )
     if project_id:
         query = query.where(ValidationRun.project_id == project_id)
     query = query.order_by(ValidationRun.created_at.desc())
